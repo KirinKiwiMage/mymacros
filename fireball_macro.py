@@ -12,8 +12,9 @@ Every wait has a small LENIENCY added so a lag spike doesn't make an
 input land before the game is ready for it.
 
 Hotkeys:
-    F8  - start / pause
-    F10 - quit
+    Numpad 7 - start
+    Numpad 8 - stop
+    Ctrl+C in the terminal - quit
 
 Requires: pip install pynput   (X11 session, which Zorin uses by default)
 """
@@ -34,8 +35,9 @@ CHARGE_TO_CAST = 0.85    # Shift release -> next Q press
 
 LENIENCY = 0.12          # extra seconds added to each wait for lag spikes
 
-TOGGLE_KEY = keyboard.Key.f8
-QUIT_KEY = keyboard.Key.f10
+# X11 keysyms: KP_7 / KP_8 with NumLock on, KP_Home / KP_Up with it off
+START_VKS = {65463, 65429}
+STOP_VKS = {65464, 65431}
 # -------------------------------------------------------------------------
 
 kb = keyboard.Controller()
@@ -89,30 +91,31 @@ def macro_loop():
 
 
 def on_press(key):
-    if key == TOGGLE_KEY:
-        if running.is_set():
-            running.clear()
-            release_all()
-            print("[macro] paused")
-        else:
-            running.set()
-            print("[macro] running")
-    elif key == QUIT_KEY:
-        print("[macro] quitting")
-        quitting.set()
+    vk = getattr(key, "vk", None)
+    if vk in START_VKS and not running.is_set():
+        running.set()
+        print("[macro] started")
+    elif vk in STOP_VKS and running.is_set():
         running.clear()
-        return False  # stops the listener
+        release_all()
+        print("[macro] stopped")
 
 
 def main():
-    print(f"[macro] F8 = start/pause, F10 = quit "
+    print(f"[macro] Numpad 7 = start, Numpad 8 = stop, Ctrl+C = quit "
           f"(cycle ~{TAP_HOLD + CAST_TO_CHARGE + CHARGE_HOLD + CHARGE_TO_CAST + 3 * LENIENCY:.2f}s)")
     worker = threading.Thread(target=macro_loop, daemon=True)
     worker.start()
-    with keyboard.Listener(on_press=on_press) as listener:
-        listener.join()
-    worker.join(timeout=1)
-    release_all()
+    try:
+        with keyboard.Listener(on_press=on_press) as listener:
+            listener.join()
+    except KeyboardInterrupt:
+        print("[macro] quitting")
+    finally:
+        quitting.set()
+        running.clear()
+        worker.join(timeout=1)
+        release_all()
 
 
 if __name__ == "__main__":
