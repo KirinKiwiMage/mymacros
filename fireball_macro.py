@@ -24,6 +24,8 @@ import time
 
 from pynput import keyboard
 
+from numpad_hotkeys import is_start, is_stop
+
 # ---- tuning -------------------------------------------------------------
 FIRE_KEY = "q"
 CHARGE_KEY = keyboard.Key.shift
@@ -34,10 +36,6 @@ CHARGE_HOLD = 0.20       # how long Shift is held while charging
 CHARGE_TO_CAST = 0.85    # Shift release -> next Q press
 
 LENIENCY = 0.12          # extra seconds added to each wait for lag spikes
-
-# X11 keysyms: KP_7 / KP_8 with NumLock on, KP_Home / KP_Up with it off
-START_VKS = {65463, 65429}
-STOP_VKS = {65464, 65431}
 # -------------------------------------------------------------------------
 
 kb = keyboard.Controller()
@@ -91,11 +89,10 @@ def macro_loop():
 
 
 def on_press(key):
-    vk = getattr(key, "vk", None)
-    if vk in START_VKS and not running.is_set():
+    if is_start(key) and not running.is_set():
         running.set()
         print("[macro] started")
-    elif vk in STOP_VKS and running.is_set():
+    elif is_stop(key) and running.is_set():
         running.clear()
         release_all()
         print("[macro] stopped")
