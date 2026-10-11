@@ -102,6 +102,10 @@ def macro_loop():
 
 def on_press(key):
     if is_start(key) and not running.is_set():
+        if isinstance(kb, DisplayKeyboard):
+            title = kb.focus()
+            print(f"[macro] focused {title!r}" if title
+                  else f"[macro] no {kb.window_name!r} window on that display")
         running.set()
         print("[macro] started")
     elif is_stop(key) and running.is_set():
@@ -130,18 +134,16 @@ def main():
         return
 
     match = None
-    if args.window:
+    if args.window and not args.display:
         match = find_window(args.window, target)
         if match is None:
             sys.exit(f"[macro] no window title contains {args.window!r} "
                      f"(try --list-windows)")
 
     if args.display:
-        kb = DisplayKeyboard(args.display)
-        if match:
-            kb.focus(match[0])
+        kb = DisplayKeyboard(args.display, args.window)
         print(f"[macro] typing on display {args.display}"
-              + (f", focused {match[1]!r}" if match else ""))
+              + (f", window {args.window!r}" if args.window else ""))
     elif match:
         wid, title = match
         kb = WindowKeyboard(wid)

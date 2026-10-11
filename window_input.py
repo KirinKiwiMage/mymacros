@@ -47,10 +47,23 @@ def list_windows(display=None):
 
 
 def find_window(name, display=None):
-    """First top-level window whose title contains `name` (case-insensitive)."""
+    """Top-level window whose title contains `name` (case-insensitive).
+    Programs often keep hidden helper windows with the same title, so prefer
+    the biggest one that's actually on screen."""
+    display = display or Display()
+
+    def rank(match):
+        window = display.create_resource_object("window", match[0])
+        try:
+            geometry = window.get_geometry()
+            viewable = window.get_attributes().map_state == X.IsViewable
+            return (viewable, geometry.width * geometry.height)
+        except Exception:
+            return (False, 0)
+
     matches = [(wid, title) for wid, title in list_windows(display)
                if name.lower() in title.lower()]
-    return matches[0] if matches else None
+    return max(matches, key=rank) if matches else None
 
 
 def _keysym(key):
@@ -104,15 +117,24 @@ class WindowKeyboard:
 class DisplayKeyboard:
     """Drop-in for pynput.keyboard.Controller that types on another X display."""
 
-    def __init__(self, display_name):
+    def __init__(self, display_name, window_name=None):
         self.display = Display(display_name)
+        self.window_name = window_name
 
-    def focus(self, window_id):
-        """Give the window keyboard focus. A bare Xephyr has no window manager,
-        so nothing moves the focus away again."""
-        window = self.display.create_resource_object("window", window_id)
+    def focus(self):
+        """Give the target window keyboard focus and return its title (None if
+        it isn't open). A bare Xephyr has no window manager, so nothing does
+        this for us, and programs that swap windows (e.g. a game going
+        fullscreen) leave the focus behind, so call it before each run."""
+        if not self.window_name:
+            return None
+        match = find_window(self.window_name, self.display)
+        if match is None:
+            return None
+        window = self.display.create_resource_object("window", match[0])
         window.set_input_focus(X.RevertToPointerRoot, X.CurrentTime)
-        self.display.flush()
+        self.display.sync()
+        return match[1]
 
     def _send(self, event_type, key):
         keycode = self.display.keysym_to_keycode(_keysym(key))
