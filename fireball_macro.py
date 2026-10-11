@@ -21,13 +21,14 @@ Background mode (keys go to one window, so you can use other windows):
     python3 fireball_macro.py --window Sober      # any part of the title
 
 Separate-display mode (Roblox in its own nested X server, real key presses):
-    ./sober_display.sh                            # start Xephyr :1 + Sober
-    python3 fireball_macro.py --display :1 --window Sober
+    ./sober_display.sh                            # starts Xephyr + Sober, prints the display
+    python3 fireball_macro.py --display :2 --window Sober
 
 Requires: pip install pynput   (X11 session, which Zorin uses by default)
 """
 
 import argparse
+import os
 import sys
 import threading
 import time
@@ -122,11 +123,18 @@ def main():
                              "instead of the focused window (with --display: "
                              "focus that window on the other display)")
     parser.add_argument("--display", metavar="NAME",
-                        help="type on another X display, e.g. :1 (a nested Xephyr)")
+                        help="type on another X display, e.g. :2 (the nested Xephyr "
+                             "sober_display.sh prints)")
     parser.add_argument("--list-windows", action="store_true",
                         help="print open windows and exit")
     args = parser.parse_args()
 
+    def server(name):           # ":1.0" / "unix:1" -> ":1"
+        return ":" + name.rsplit(":", 1)[-1].split(".")[0]
+
+    if args.display and server(args.display) == server(os.environ.get("DISPLAY", ":0")):
+        sys.exit(f"[macro] {args.display} is your own desktop, not a nested display. "
+                 f"Use the one sober_display.sh printed.")
     target = Display(args.display) if args.display else None
     if args.list_windows:
         for wid, title in list_windows(target):
