@@ -16,15 +16,22 @@ Hotkeys:
     Numpad 8 - stop
     Ctrl+C in the terminal - quit
 
+Background mode (keys go to one window, so you can use other windows):
+    python3 fireball_macro.py --list-windows      # find the game's title
+    python3 fireball_macro.py --window Sober      # any part of the title
+
 Requires: pip install pynput   (X11 session, which Zorin uses by default)
 """
 
+import argparse
+import sys
 import threading
 import time
 
 from pynput import keyboard
 
 from numpad_hotkeys import is_start, is_stop
+from window_input import WindowKeyboard, find_window, list_windows
 
 # ---- tuning -------------------------------------------------------------
 FIRE_KEY = "q"
@@ -99,6 +106,30 @@ def on_press(key):
 
 
 def main():
+    global kb
+    parser = argparse.ArgumentParser(description="Fireball / charge loop macro")
+    parser.add_argument("--window", metavar="TITLE",
+                        help="send keys to the window whose title contains TITLE "
+                             "instead of the focused window")
+    parser.add_argument("--list-windows", action="store_true",
+                        help="print open windows and exit")
+    args = parser.parse_args()
+
+    if args.list_windows:
+        for wid, title in list_windows():
+            print(f"0x{wid:08x}  {title}")
+        return
+
+    if args.window:
+        match = find_window(args.window)
+        if match is None:
+            sys.exit(f"[macro] no window title contains {args.window!r} "
+                     f"(try --list-windows)")
+        wid, title = match
+        kb = WindowKeyboard(wid)
+        kb.focus()
+        print(f"[macro] sending keys to 0x{wid:08x} {title!r}")
+
     print(f"[macro] Numpad 7 = start, Numpad 8 = stop, Ctrl+C = quit "
           f"(cycle ~{TAP_HOLD + CAST_TO_CHARGE + CHARGE_HOLD + CHARGE_TO_CAST + 3 * LENIENCY:.2f}s)")
     worker = threading.Thread(target=macro_loop, daemon=True)
