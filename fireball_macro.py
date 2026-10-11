@@ -11,7 +11,9 @@ Cycle (timed from the recordings, ~2.2s per loop):
 
 Cooldowns (read off the spell list greying out in the recording):
     Fireball ~1.75s, Fire Pillar ~6.1s, each starting ~0.6s after the key
-    press once the cast animation finishes. Fire Pillar lands every 3rd cast.
+    press once the cast animation finishes. In game R stays unusable a bit
+    longer than the spell list shows, so PILLAR_COOLDOWN has extra margin,
+    and the loop waits briefly for Fire Pillar when it's almost ready.
 
 Every wait has a small LENIENCY added so a lag spike doesn't make an
 input land before the game is ready for it.
@@ -50,7 +52,11 @@ PILLAR_KEY = "r"
 CHARGE_KEY = keyboard.Key.shift
 
 FIRE_COOLDOWN = 1.75     # Fireball cooldown (from the spell list greying out)
-PILLAR_COOLDOWN = 6.10   # Fire Pillar cooldown
+PILLAR_COOLDOWN = 7.50   # Fire Pillar cooldown. The spell list greys out
+                         # for ~6.1s, but the game ignores R for longer than
+                         # that; raise this if R still gets pressed too early
+PILLAR_WAIT = 1.00       # wait up to this long for Fire Pillar to come off
+                         # cooldown rather than casting a Fireball instead
 CAST_DELAY = 0.70        # key press -> cooldown starts (cast animation)
 
 TAP_HOLD = 0.05          # how long Q / R is held down for a "tap"
@@ -111,7 +117,7 @@ def macro_loop():
             continue
 
         # 1. fire pillar when it's up, fireball otherwise
-        key = PILLAR_KEY if ready_in(PILLAR_KEY) == 0 else FIRE_KEY
+        key = PILLAR_KEY if ready_in(PILLAR_KEY) <= PILLAR_WAIT else FIRE_KEY
         if not wait(ready_in(key)):
             continue
         press_for(key, TAP_HOLD)
