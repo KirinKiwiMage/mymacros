@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
 """
-Fireball / charge loop macro (pynput, X11).
+Fireball / Fire Pillar / charge loop macro (pynput, X11).
 
-Cycle (timed from the recording, ~2.2s per loop):
-    1. Tap Q          -> fireball cast animation plays (~0.6s), mana drops
+Cycle (timed from the recordings, ~2.2s per loop):
+    1. Cast           -> R (Fire Pillar) if its cooldown is up, otherwise
+                         Q (Fireball); the cast animation plays, mana drops
     2. Wait           -> ~1.1s after the cast, mana is ready to recharge
     3. Hold Shift     -> charge, mana bar refills almost instantly
     4. Wait           -> ~1.0s, then loop back to 1
+
+Cooldowns (read off the spell list greying out in the recording):
+    Fireball ~1.75s, Fire Pillar ~6.1s, each starting ~0.6s after the key
+    press once the cast animation finishes. Fire Pillar lands every 3rd cast.
 
 Every wait has a small LENIENCY added so a lag spike doesn't make an
 input land before the game is ready for it.
@@ -41,12 +46,17 @@ from window_input import DisplayKeyboard, WindowKeyboard, find_window, list_wind
 
 # ---- tuning -------------------------------------------------------------
 FIRE_KEY = "q"
+PILLAR_KEY = "r"
 CHARGE_KEY = keyboard.Key.shift
 
-TAP_HOLD = 0.05          # how long Q is held down for a "tap"
-CAST_TO_CHARGE = 1.10    # Q press -> Shift press (cast anim + mana drop)
+FIRE_COOLDOWN = 1.75     # Fireball cooldown (from the spell list greying out)
+PILLAR_COOLDOWN = 6.10   # Fire Pillar cooldown
+CAST_DELAY = 0.70        # key press -> cooldown starts (cast animation)
+
+TAP_HOLD = 0.05          # how long Q / R is held down for a "tap"
+CAST_TO_CHARGE = 1.10    # Q/R press -> Shift press (cast anim + mana drop)
 CHARGE_HOLD = 0.20       # how long Shift is held while charging
-CHARGE_TO_CAST = 0.85    # Shift release -> next Q press
+CHARGE_TO_CAST = 0.85    # Shift release -> next Q/R press
 
 LENIENCY = 0.12          # extra seconds added to each wait for lag spikes
 # -------------------------------------------------------------------------
@@ -54,6 +64,18 @@ LENIENCY = 0.12          # extra seconds added to each wait for lag spikes
 kb = keyboard.Controller()
 running = threading.Event()
 quitting = threading.Event()
+
+COOLDOWNS = {FIRE_KEY: FIRE_COOLDOWN, PILLAR_KEY: PILLAR_COOLDOWN}
+last_cast = {}           # key -> time.monotonic() of its last press; kept
+                         # across stop/start since the game's cooldowns are
+
+
+def ready_in(key):
+    """Seconds until `key`'s spell is off cooldown (0 if ready now)."""
+    if key not in last_cast:
+        return 0.0
+    ready_at = last_cast[key] + CAST_DELAY + COOLDOWNS[key] + LENIENCY
+    return max(0.0, ready_at - time.monotonic())
 
 
 def wait(seconds):
@@ -76,7 +98,7 @@ def press_for(key, hold):
 
 
 def release_all():
-    for key in (FIRE_KEY, CHARGE_KEY):
+    for key in (FIRE_KEY, PILLAR_KEY, CHARGE_KEY):
         try:
             kb.release(key)
         except Exception:
@@ -88,8 +110,12 @@ def macro_loop():
         if not running.wait(timeout=0.1):
             continue
 
-        # 1. fireball
-        press_for(FIRE_KEY, TAP_HOLD)
+        # 1. fire pillar when it's up, fireball otherwise
+        key = PILLAR_KEY if ready_in(PILLAR_KEY) == 0 else FIRE_KEY
+        if not wait(ready_in(key)):
+            continue
+        press_for(key, TAP_HOLD)
+        last_cast[key] = time.monotonic()
         if not wait(CAST_TO_CHARGE + LENIENCY):
             continue
 
