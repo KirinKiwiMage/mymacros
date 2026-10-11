@@ -1,18 +1,21 @@
 """
-Send key presses straight to one X11 window (XSendEvent) instead of to
-whatever window has focus, so a macro can run in the background while you
-use the rest of the desktop.
+Send key presses somewhere other than the window you're using, so a macro
+can run in the background while you use the rest of the desktop.
 
-The X server marks these events as synthetic, and some programs ignore
-synthetic input. If the target doesn't react, it's one of those.
+WindowKeyboard: XSendEvent straight to one window on your desktop. The X
+    server marks these events as synthetic, and some programs ignore them.
+DisplayKeyboard: real (XTEST) key presses on a separate X display, such as
+    a nested Xephyr server (see sober_display.sh). The program can't tell
+    them apart from a keyboard, and your own desktop never sees them.
 
-WindowKeyboard has the same press()/release() interface as
-pynput.keyboard.Controller, so it can be dropped in place of one.
+Both have the same press()/release() interface as
+pynput.keyboard.Controller, so they can be dropped in place of one.
 """
 
 from pynput import keyboard
 from Xlib import X, XK, protocol
 from Xlib.display import Display
+from Xlib.ext import xtest
 
 # keysym -> modifier mask, so held modifiers show up in the event state
 _MODIFIERS = {
@@ -96,3 +99,28 @@ class WindowKeyboard:
     def release(self, key):
         keysym = self._send(protocol.event.KeyRelease, key)
         self.state &= ~_MODIFIERS.get(keysym, 0)
+
+
+class DisplayKeyboard:
+    """Drop-in for pynput.keyboard.Controller that types on another X display."""
+
+    def __init__(self, display_name):
+        self.display = Display(display_name)
+
+    def focus(self, window_id):
+        """Give the window keyboard focus. A bare Xephyr has no window manager,
+        so nothing moves the focus away again."""
+        window = self.display.create_resource_object("window", window_id)
+        window.set_input_focus(X.RevertToPointerRoot, X.CurrentTime)
+        self.display.flush()
+
+    def _send(self, event_type, key):
+        keycode = self.display.keysym_to_keycode(_keysym(key))
+        xtest.fake_input(self.display, event_type, keycode)
+        self.display.flush()
+
+    def press(self, key):
+        self._send(X.KeyPress, key)
+
+    def release(self, key):
+        self._send(X.KeyRelease, key)

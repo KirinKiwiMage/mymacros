@@ -20,6 +20,10 @@ Background mode (keys go to one window, so you can use other windows):
     python3 fireball_macro.py --list-windows      # find the game's title
     python3 fireball_macro.py --window Sober      # any part of the title
 
+Separate-display mode (Roblox in its own nested X server, real key presses):
+    ./sober_display.sh                            # start Xephyr :1 + Sober
+    python3 fireball_macro.py --display :1 --window Sober
+
 Requires: pip install pynput   (X11 session, which Zorin uses by default)
 """
 
@@ -29,9 +33,10 @@ import threading
 import time
 
 from pynput import keyboard
+from Xlib.display import Display
 
 from numpad_hotkeys import is_start, is_stop
-from window_input import WindowKeyboard, find_window, list_windows
+from window_input import DisplayKeyboard, WindowKeyboard, find_window, list_windows
 
 # ---- tuning -------------------------------------------------------------
 FIRE_KEY = "q"
@@ -110,21 +115,34 @@ def main():
     parser = argparse.ArgumentParser(description="Fireball / charge loop macro")
     parser.add_argument("--window", metavar="TITLE",
                         help="send keys to the window whose title contains TITLE "
-                             "instead of the focused window")
+                             "instead of the focused window (with --display: "
+                             "focus that window on the other display)")
+    parser.add_argument("--display", metavar="NAME",
+                        help="type on another X display, e.g. :1 (a nested Xephyr)")
     parser.add_argument("--list-windows", action="store_true",
                         help="print open windows and exit")
     args = parser.parse_args()
 
+    target = Display(args.display) if args.display else None
     if args.list_windows:
-        for wid, title in list_windows():
+        for wid, title in list_windows(target):
             print(f"0x{wid:08x}  {title}")
         return
 
+    match = None
     if args.window:
-        match = find_window(args.window)
+        match = find_window(args.window, target)
         if match is None:
             sys.exit(f"[macro] no window title contains {args.window!r} "
                      f"(try --list-windows)")
+
+    if args.display:
+        kb = DisplayKeyboard(args.display)
+        if match:
+            kb.focus(match[0])
+        print(f"[macro] typing on display {args.display}"
+              + (f", focused {match[1]!r}" if match else ""))
+    elif match:
         wid, title = match
         kb = WindowKeyboard(wid)
         kb.focus()
