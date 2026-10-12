@@ -22,6 +22,10 @@ Usage:
                                                    # locks/sockets/temp files
     python3 sober_multi.py trace alt1 alt2         # launch + record Sober's D-Bus
 
+launch options:
+    --isolate-runtime   own /tmp and /run/user per profile (experimental)
+    --share-ipc         don't give each instance its own IPC namespace
+
 A new profile copies your normal Sober's config.json and downloaded Roblox
 files (so it doesn't download them again), but not your login: log in once
 per profile, after that it sticks. Your normal Sober (plain
@@ -81,10 +85,34 @@ def ensure_profile(name):
     return root, True
 
 
-def flatpak_env(fake_home):
+REAL_RUNTIME = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+RUNTIME_PROFILES = os.path.join(REAL_RUNTIME, "sober-multi")
+# Sockets flatpak hands into the sandbox from the runtime dir.
+RUNTIME_LINKS = ("pulse", "pipewire-0", "bus", "at-spi", "dconf")
+
+
+def fake_runtime(name):
+    """Per-profile XDG_RUNTIME_DIR. Flatpak shares /tmp and /run/user/UID
+    between all instances of one app ID, keyed off the host runtime dir, so
+    a separate one per profile splits those too. Audio/D-Bus sockets are
+    symlinked from the real one."""
+    rt = os.path.join(RUNTIME_PROFILES, name)
+    os.makedirs(rt, mode=0o700, exist_ok=True)
+    wayland = [e for e in os.listdir(REAL_RUNTIME) if e.startswith("wayland-")]
+    for entry in (*RUNTIME_LINKS, *wayland):
+        src, dst = os.path.join(REAL_RUNTIME, entry), os.path.join(rt, entry)
+        if os.path.exists(src) and not os.path.lexists(dst):
+            os.symlink(src, dst)
+    return rt
+
+
+def flatpak_env(fake_home, runtime_dir=None):
     """Host env for `flatpak run` with HOME swapped to the profile, keeping
     everything flatpak itself still needs from the real home."""
     env = dict(os.environ, HOME=fake_home)
+    if runtime_dir:
+        env["XDG_RUNTIME_DIR"] = runtime_dir
+        env.setdefault("DBUS_SESSION_BUS_ADDRESS", f"unix:path={REAL_RUNTIME}/bus")
     # Sober may be a --user install, which flatpak finds via HOME.
     env.setdefault("FLATPAK_USER_DIR", os.path.join(
         os.environ.get("XDG_DATA_HOME") or os.path.join(REAL_HOME, ".local", "share"), "flatpak"))
@@ -103,7 +131,7 @@ def check_sober():
         sys.exit(f"{APP_ID} isn't installed. Run: flatpak install flathub {APP_ID}")
 
 
-def launch(names, extra_args, share_ipc=False):
+def launch(names, extra_args, share_ipc=False, isolate_runtime=False):
     check_sober()
     for i, name in enumerate(names):
         if i:
@@ -116,7 +144,8 @@ def launch(names, extra_args, share_ipc=False):
         # instance its own.
         flags = [] if share_ipc else ["--unshare=ipc"]
         proc = subprocess.Popen(["flatpak", "run", *flags, APP_ID, *extra_args],
-                                env=flatpak_env(root), cwd=root,
+                                env=flatpak_env(root, fake_runtime(name) if isolate_runtime else None),
+                                cwd=root,
                                 stdout=log, stderr=subprocess.STDOUT,
                                 stdin=subprocess.DEVNULL, start_new_session=True)
         log.close()
@@ -162,9 +191,9 @@ def _children(pid):
     return out
 
 
-def _sh(cmd):
+def _sh(cmd, env=None):
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=10, env=env)
         return (r.stdout + r.stderr).strip()
     except (OSError, subprocess.TimeoutExpired) as e:
         return f"<{e}>"
@@ -206,6 +235,62 @@ def _find_inodes(wanted):
         walk(os.path.expanduser("~"), skip=APP_DIR)
 
 
+def _ps_envs():
+    """`flatpak ps` only sees instances under its XDG_RUNTIME_DIR, so also
+    look in each --isolate-runtime profile's."""
+    envs = [None]
+    if os.path.isdir(RUNTIME_PROFILES):
+        envs += [dict(os.environ, XDG_RUNTIME_DIR=os.path.join(RUNTIME_PROFILES, n))
+                 for n in sorted(os.listdir(RUNTIME_PROFILES))]
+    return envs
+
+
+def _x11_report():
+    """X atoms, selection owners and window properties mentioning Sober:
+    the X server is shared by every instance whatever the sandbox does."""
+    try:
+        from Xlib import X, display, error
+    except ImportError:
+        return ["  (python-xlib not installed)"]
+    out = []
+    try:
+        d = display.Display()
+    except Exception as e:
+        return [f"  <{e}>"]
+    pat = re.compile(r"sober|roblox|vinegar|sdl", re.I)
+    misses, atom = 0, 1
+    while misses < 50 and atom < 20000:
+        try:
+            name = d.get_atom_name(atom)
+            misses = 0
+            if pat.search(name):
+                owner = d.get_selection_owner(atom)
+                owned = f" selection owner 0x{owner.id:x}" if owner != X.NONE else ""
+                out.append(f"  atom {atom} {name}{owned}")
+        except error.BadAtom:
+            misses += 1
+        atom += 1
+    root = d.screen().root
+    for prop in root.list_properties():
+        name = d.get_atom_name(prop)
+        if pat.search(name):
+            out.append(f"  root property {name}")
+    clients = root.get_full_property(d.intern_atom("_NET_CLIENT_LIST"), X.AnyPropertyType)
+    for wid in (clients.value if clients else []):
+        w = d.create_resource_object("window", wid)
+        try:
+            cls = w.get_wm_class() or ()
+            if not any(pat.search(c) for c in cls):
+                continue
+            pid = w.get_full_property(d.intern_atom("_NET_WM_PID"), X.AnyPropertyType)
+            props = sorted(d.get_atom_name(p) for p in w.list_properties())
+            out.append(f"  window 0x{wid:x} class={cls} pid={pid.value[0] if pid else '?'}")
+            out.append(f"    props: {' '.join(props)}")
+        except error.XError:
+            pass
+    return out or ["  (nothing matching)"]
+
+
 def diagnose():
     """Dump how a running Sober could be spotting other instances: open
     files, file locks, unix sockets, D-Bus names, temp/runtime dirs."""
@@ -215,10 +300,11 @@ def diagnose():
                                        if "sober" in l.lower() or "vinegar" in l.lower()) or "(none matching)"]
 
     pids = []
-    for line in _sh(["flatpak", "ps", "--columns=pid,application"]).splitlines():
-        parts = line.split()
-        if len(parts) == 2 and parts[1] == APP_ID and parts[0].isdigit():
-            pids += _children(int(parts[0]))
+    for env in _ps_envs():
+        for line in _sh(["flatpak", "ps", "--columns=pid,application"], env).splitlines():
+            parts = line.split()
+            if len(parts) == 2 and parts[1] == APP_ID and parts[0].isdigit():
+                pids += _children(int(parts[0]))
     if not pids:
         out.append("!! No running Sober: this is a baseline to compare against.")
 
@@ -303,6 +389,7 @@ def diagnose():
     except OSError as e:
         names = [f"<{e.strerror}>"]
     out += ["== abstract unix sockets (shared network namespace)"] + [f"  {n}" for n in names]
+    out += ["== X11 (shared by all instances)"] + _x11_report()
     if pids:
         # The sandbox's view of the filesystem: the innermost bwrap we can read.
         root = next((f"/proc/{p}/root" for p in reversed(pids)
@@ -402,6 +489,8 @@ def main():
                     help="profile names; args after -- go to Sober (e.g. a roblox:// link)")
     pl.add_argument("--share-ipc", action="store_true",
                     help="don't give instances their own IPC namespace (if graphics break)")
+    pl.add_argument("--isolate-runtime", action="store_true",
+                    help="give each profile its own /tmp and /run/user (experimental)")
     sub.add_parser("list", help="list profiles")
     pr = sub.add_parser("remove", help="delete profiles")
     pr.add_argument("names", nargs="+")
@@ -419,7 +508,7 @@ def main():
     args = p.parse_args(argv)
 
     if args.cmd == "launch":
-        launch(args.names, extra, args.share_ipc)
+        launch(args.names, extra, args.share_ipc, args.isolate_runtime)
     elif args.cmd == "list":
         list_profiles()
     elif args.cmd == "remove":
