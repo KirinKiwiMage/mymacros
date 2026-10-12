@@ -7,13 +7,19 @@ When a fish bites, the screen gets a coloured tint and circles show up:
     Dark blue tint  ("timing")   - a white disc with a dark ring shrinking onto
                                    it. Click the moment the ring closes in,
                                    which is when the disc turns pure white.
-    Light blue tint ("any time") - coloured discs pop up all over the screen.
-                                   They can be clicked at any time, so each one
-                                   is clicked as soon as it appears.
+    Light blue tint ("any time") - coloured discs pop up all over the screen,
+                                   each with a ring of its own colour. A disc
+                                   can be hit any time while its ring is
+                                   shrinking, but not in the first moment
+                                   before the ring starts moving, so it is
+                                   clicked once the ring is part-way in.
 
 Either version can come at any difficulty (higher = faster), so nothing here
 depends on the difficulty. Both penalise clicks that miss, so the macro only
 ever clicks on the centre of a disc it has found on screen.
+
+Run with --debug to print what it sees and save marked-up screenshots of every
+click (and of rounds where it finds nothing) to ~/fishing_debug/.
 
 Hotkeys:
     Numpad 7 - start
@@ -24,8 +30,13 @@ Requires: pynput, python-xlib and numpy   (X11 session)
     sudo apt install python3-pynput python3-xlib python3-numpy
 """
 
+import os
+import queue
+import struct
+import sys
 import threading
 import time
+import zlib
 
 import numpy as np
 from pynput import keyboard, mouse
@@ -42,8 +53,12 @@ DISC_R_TOLERANCE = (0.4, 1.8)   # accept blobs this many times the expected radi
 
 WHITE_MIN = 245          # timing: every channel this bright = ring has closed
 COLOR_DIFF = 110         # any time: how far a pixel's colour must be from the tint
+RING_DIFF = 70           # any time: same, for the thinner approach ring
+RING_SEARCH = 4          # look for the ring out to this many disc radii
+MAX_DISC_R = 0.06        # fraction of screen height; caps the ring search
 
-ANYTIME_FIRST_DELAY = 0.05  # wait after a disc first appears before clicking it
+ANYTIME_CLICK_RATIO = 1.6  # any time: click once ring radius <= this x disc radius
+                           # (rings start ~2.9x and close to 1.0x; hits counted 1.0-2.0)
 RECLICK_AFTER = 0.40        # click the same spot again if the disc is still there
 CLICK_GAP = 0.04            # minimum time between two clicks
 MOVE_SETTLE = 0.035         # time between moving the mouse and pressing (~2 game frames)
@@ -59,6 +74,9 @@ LENIENCY = 0.03             # extra seconds added to waits for lag spikes
 
 STRIDE = 2   # analyse every 2nd pixel
 CELL = 4     # blobs are found on a grid of CELLxCELL analysed pixels
+
+DEBUG = "--debug" in sys.argv
+DEBUG_DIR = os.path.expanduser("~/fishing_debug")
 
 clicker = mouse.Controller()
 running = threading.Event()
@@ -79,7 +97,7 @@ def classify(frame):
 def find_discs(mask, expected_r):
     """Find filled round blobs in a boolean mask (in analysed-pixel units).
     Thin rings don't fill grid cells, so they are ignored.
-    Returns a list of (x, y) centres in analysed-pixel units."""
+    Returns a list of (x, y, radius) in analysed-pixel units."""
     h, w = mask.shape
     h, w = h - h % CELL, w - w % CELL
     cells = mask[:h, :w].reshape(h // CELL, CELL, w // CELL, CELL).mean(axis=(1, 3)) >= 0.6
@@ -107,13 +125,39 @@ def find_discs(mask, expected_r):
         bw, bh = np.ptp(xs) + 1, np.ptp(ys) + 1
         round_enough = 0.75 < bw / bh < 1.33 and 0.6 < len(blob) / (bw * bh) < 0.92
         if lo * expected_r <= radius <= hi * expected_r and round_enough:
-            discs.append(((xs.mean() + 0.5) * CELL, (ys.mean() + 0.5) * CELL))
+            discs.append(((xs.mean() + 0.5) * CELL, (ys.mean() + 0.5) * CELL, radius))
     return discs
 
 
+def ring_ratio(small, tint, x, y):
+    """How far a disc's approach ring is from the disc's edge, as ring radius /
+    disc radius (1.0 = closed onto the edge). Measured along 16 rays from the
+    centre: each ray crosses the disc, a gap of background, then the ring.
+    Rays that hit something else are outvoted by the median.
+    Returns None if this doesn't look like a disc with a ring."""
+    h, w = small.shape[:2]
+    angles = np.linspace(0, 2 * np.pi, 16, endpoint=False)
+    steps = np.arange(1, int(RING_SEARCH * MAX_DISC_R * h))
+    px = (x + np.outer(np.cos(angles), steps)).astype(int)
+    py = (y + np.outer(np.sin(angles), steps)).astype(int)
+    inside = (px >= 0) & (px < w) & (py >= 0) & (py < h)
+    samples = small[py.clip(0, h - 1), px.clip(0, w - 1)]
+    coloured = (np.abs(samples - tint).sum(axis=2) > RING_DIFF) & inside
+
+    ratios = []
+    for ray, ok in zip(coloured, inside):
+        gap = np.argmax(~ray)                    # first step off the disc
+        if ray[gap] or not ok[gap]:
+            continue                             # never left the disc / ran off screen
+        ring = np.argmax(ray[gap:])
+        # No separate ring past the disc = it has closed onto the edge.
+        ratios.append((gap + ring + 1) / (gap + 1) if ray[gap + ring] else 1.0)
+    return float(np.median(ratios)) if len(ratios) >= 4 else None
+
+
 def detect(frame):
-    """Return (mode, [(x, y), ...]) with disc centres to click, in frame pixels.
-    In timing mode only discs whose ring has closed are returned."""
+    """Return (mode, [(x, y), ...]) with centres of discs ready to click, in
+    frame pixels (timing: ring has closed; any time: ring is part-way in)."""
     mode, tint = classify(frame)
     if mode is None:
         return None, []
@@ -123,9 +167,15 @@ def detect(frame):
         mask = small.min(axis=2) >= WHITE_MIN
         expected = TIMING_DISC_R * height / STRIDE
     else:
-        mask = np.abs(small - np.array(tint, dtype=np.int16)).sum(axis=2) > COLOR_DIFF
+        tint = np.array(tint, dtype=np.int16)
+        mask = np.abs(small - tint).sum(axis=2) > COLOR_DIFF
         expected = ANYTIME_DISC_R * height / STRIDE
-    return mode, [(x * STRIDE, y * STRIDE) for x, y in find_discs(mask, expected)]
+    discs = find_discs(mask, expected)
+    if mode == "anytime":
+        discs = [d for d in discs
+                 if (ratio := ring_ratio(small, tint, d[0], d[1])) is not None
+                 and ratio <= ANYTIME_CLICK_RATIO]
+    return mode, [(x * STRIDE, y * STRIDE) for x, y, _ in discs]
 
 
 class Screen:
@@ -158,6 +208,45 @@ def click_at(x, y):
     clicker.release(mouse.Button.left)
 
 
+def save_png(path, rgb):
+    h, w, _ = rgb.shape
+    raw = b"".join(b"\x00" + rgb[y].tobytes() for y in range(h))
+
+    def chunk(kind, data):
+        body = kind + data
+        return struct.pack(">I", len(data)) + body + struct.pack(">I", zlib.crc32(body))
+
+    with open(path, "wb") as f:
+        f.write(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+                + chunk(b"IDAT", zlib.compress(raw, 1)) + chunk(b"IEND", b""))
+
+
+debug_queue = queue.Queue()
+
+
+def debug_writer():
+    """Saves debug screenshots in the background so clicking isn't slowed down."""
+    count = 0
+    while True:
+        name, frame, discs, click = debug_queue.get()
+        img = frame[::2, ::2].copy()
+        for x, y in discs:   # green box around every disc found
+            x, y = int(x) // 2, int(y) // 2
+            img[max(y - 20, 0):y + 20, max(x - 20, 0):x + 20][[0, -1]] = (0, 255, 0)
+            img[max(y - 20, 0):y + 20, max(x - 20, 0):x + 20][:, [0, -1]] = (0, 255, 0)
+        if click:            # red cross where we clicked
+            x, y = int(click[0]) // 2, int(click[1]) // 2
+            img[y, max(x - 12, 0):x + 12] = (255, 0, 0)
+            img[max(y - 12, 0):y + 12, x] = (255, 0, 0)
+        count += 1
+        save_png(os.path.join(DEBUG_DIR, f"{count:04d}_{name}.png"), img)
+
+
+def debug_shot(name, frame, discs, click=None):
+    if DEBUG:
+        debug_queue.put((name, frame.copy(), list(discs), click))
+
+
 def macro_loop():
     with Screen() as screen:
         while not quitting.is_set():
@@ -167,11 +256,23 @@ def macro_loop():
             last_mode_time = None
             recast_done = True
             last_click = -1e9
+            last_mode = "start"
+            last_empty_shot = 0
 
             while running.is_set() and not quitting.is_set():
                 frame = screen.grab()
                 now = time.monotonic()
                 mode, discs = detect(frame)
+
+                if DEBUG:
+                    if mode != last_mode:
+                        print(f"mode: {mode}  tint: {classify(frame)[1]}  screen: "
+                              f"{frame.shape[1]}x{frame.shape[0]}")
+                        debug_shot(f"mode_{mode}", frame, discs)
+                        last_mode = mode
+                    if mode and not discs and now - last_empty_shot > 1.0:
+                        debug_shot(f"{mode}_nothing_found", frame, discs)
+                        last_empty_shot = now
 
                 if mode is None:
                     tracked.clear()
@@ -199,8 +300,6 @@ def macro_loop():
                 tracked = still_there
 
                 for disc in sorted(tracked, key=lambda d: d["first"]):
-                    if mode == "anytime" and now - disc["first"] < ANYTIME_FIRST_DELAY:
-                        continue
                     if now - disc["clicked"] < RECLICK_AFTER:
                         continue
                     gap = CLICK_GAP - (time.monotonic() - last_click)
@@ -208,6 +307,7 @@ def macro_loop():
                         time.sleep(gap)
                     click_at(disc["x"], disc["y"])
                     disc["clicked"] = last_click = time.monotonic()
+                    debug_shot(f"{mode}_click", frame, discs, (disc["x"], disc["y"]))
                     print(f"{mode}: click at ({disc['x']:.0f}, {disc['y']:.0f})")
 
                 time.sleep(0.005)
@@ -224,6 +324,10 @@ def on_press(key):
 
 def main():
     print("Fishing macro ready. Numpad 7 = start, Numpad 8 = stop, Ctrl+C = quit.")
+    if DEBUG:
+        os.makedirs(DEBUG_DIR, exist_ok=True)
+        threading.Thread(target=debug_writer, daemon=True).start()
+        print(f"Debug on: screenshots go to {DEBUG_DIR}")
     threading.Thread(target=macro_loop, daemon=True).start()
     listener = keyboard.Listener(on_press=on_press)
     listener.start()
