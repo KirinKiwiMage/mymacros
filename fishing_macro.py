@@ -36,6 +36,7 @@ import struct
 import sys
 import threading
 import time
+import traceback
 import zlib
 
 import numpy as np
@@ -156,11 +157,12 @@ def ring_ratio(small, tint, x, y):
 
 
 def detect(frame):
-    """Return (mode, [(x, y), ...]) with centres of discs ready to click, in
-    frame pixels (timing: ring has closed; any time: ring is part-way in)."""
+    """Return (mode, ready, found): centres [(x, y), ...] of discs ready to
+    click, in frame pixels (timing: ring has closed; any time: ring is part-way
+    in), and how many discs were found in total."""
     mode, tint = classify(frame)
     if mode is None:
-        return None, []
+        return None, [], 0
     small = frame[::STRIDE, ::STRIDE].astype(np.int16)
     height = frame.shape[0]
     if mode == "timing":
@@ -170,28 +172,46 @@ def detect(frame):
         tint = np.array(tint, dtype=np.int16)
         mask = np.abs(small - tint).sum(axis=2) > COLOR_DIFF
         expected = ANYTIME_DISC_R * height / STRIDE
-    discs = find_discs(mask, expected)
+    found = find_discs(mask, expected)
+    ready = found
     if mode == "anytime":
-        discs = [d for d in discs
+        ready = [d for d in found
                  if (ratio := ring_ratio(small, tint, d[0], d[1])) is not None
                  and ratio <= ANYTIME_CLICK_RATIO]
-    return mode, [(x * STRIDE, y * STRIDE) for x, y, _ in discs]
+    return mode, [(x * STRIDE, y * STRIDE) for x, y, _ in ready], len(found)
 
 
 class Screen:
-    """Grabs screenshots of the whole X screen as RGB numpy arrays."""
+    """Grabs screenshots, as RGB numpy arrays, of the monitor the mouse is on
+    (the X screen spans every monitor, and other monitors would throw off the
+    tint check). After grab(), .area is that monitor's (x, y, width, height)."""
 
     def __enter__(self):
         self.display = Display()
         self.root = self.display.screen().root
         geom = self.root.get_geometry()
-        self.width, self.height = geom.width, geom.height
+        self.monitors = [(0, 0, geom.width, geom.height)]
+        try:
+            from Xlib.ext import randr
+            found = randr.get_monitors(self.root, is_active=True).monitors
+            if found:
+                self.monitors = [(m.x, m.y, m.width_in_pixels, m.height_in_pixels)
+                                 for m in found]
+        except Exception:
+            pass   # no RandR: fall back to the whole screen
+        self.area = self.monitors[0]
         return self
 
     def grab(self):
-        image = self.root.get_image(0, 0, self.width, self.height, X.ZPixmap, 0xFFFFFFFF)
+        pointer = self.root.query_pointer()
+        for x, y, w, h in self.monitors:
+            if x <= pointer.root_x < x + w and y <= pointer.root_y < y + h:
+                self.area = (x, y, w, h)
+                break
+        x, y, w, h = self.area
+        image = self.root.get_image(x, y, w, h, X.ZPixmap, 0xFFFFFFFF)
         pixels = np.frombuffer(image.data, dtype=np.uint8)
-        return pixels.reshape(self.height, self.width, 4)[:, :, 2::-1]   # BGRX -> RGB
+        return pixels.reshape(h, w, 4)[:, :, 2::-1]   # BGRX -> RGB
 
     def __exit__(self, *_):
         self.display.close()
@@ -258,59 +278,69 @@ def macro_loop():
             last_click = -1e9
             last_mode = "start"
             last_empty_shot = 0
+            last_status = 0
 
             while running.is_set() and not quitting.is_set():
-                frame = screen.grab()
-                now = time.monotonic()
-                mode, discs = detect(frame)
+                try:
+                    frame = screen.grab()
+                    ox, oy = screen.area[:2]
+                    now = time.monotonic()
+                    mode, discs, found = detect(frame)
 
-                if DEBUG:
-                    if mode != last_mode:
-                        print(f"mode: {mode}  tint: {classify(frame)[1]}  screen: "
-                              f"{frame.shape[1]}x{frame.shape[0]}")
-                        debug_shot(f"mode_{mode}", frame, discs)
-                        last_mode = mode
-                    if mode and not discs and now - last_empty_shot > 1.0:
-                        debug_shot(f"{mode}_nothing_found", frame, discs)
-                        last_empty_shot = now
+                    if mode != last_mode or now - last_status >= 2.0:
+                        tint = ", ".join(str(int(c)) for c in classify(frame)[1])
+                        print(f"[{mode or 'no minigame'}] tint ({tint})  monitor "
+                              f"{frame.shape[1]}x{frame.shape[0]} at {ox},{oy}  "
+                              f"discs found {found}, ready {len(discs)}")
+                        last_status = now
+                    if DEBUG:
+                        if mode != last_mode:
+                            debug_shot(f"mode_{mode}", frame, discs)
+                        if mode and not discs and now - last_empty_shot > 1.0:
+                            debug_shot(f"{mode}_nothing_found", frame, discs)
+                            last_empty_shot = now
+                    last_mode = mode
 
-                if mode is None:
-                    tracked.clear()
-                    if (AUTO_RECAST and not recast_done and last_mode_time
-                            and now - last_mode_time >= RECAST_DELAY + LENIENCY):
-                        print("re-casting")
-                        click_at(frame.shape[1] // 2, frame.shape[0] // 2)
-                        recast_done = True
-                    continue
-                last_mode_time = now
-                recast_done = False
-
-                # Match each disc to the one seen nearest to it last frame.
-                match_dist = ANYTIME_DISC_R * frame.shape[0]
-                still_there = []
-                for x, y in discs:
-                    old = min(tracked, default=None,
-                              key=lambda d: (d["x"] - x) ** 2 + (d["y"] - y) ** 2)
-                    if old and (old["x"] - x) ** 2 + (old["y"] - y) ** 2 < match_dist ** 2:
-                        tracked.remove(old)
-                        old["x"], old["y"] = x, y
-                        still_there.append(old)
-                    else:
-                        still_there.append({"x": x, "y": y, "first": now, "clicked": -1e9})
-                tracked = still_there
-
-                for disc in sorted(tracked, key=lambda d: d["first"]):
-                    if now - disc["clicked"] < RECLICK_AFTER:
+                    if mode is None:
+                        tracked.clear()
+                        if (AUTO_RECAST and not recast_done and last_mode_time
+                                and now - last_mode_time >= RECAST_DELAY + LENIENCY):
+                            print("re-casting")
+                            click_at(ox + frame.shape[1] // 2, oy + frame.shape[0] // 2)
+                            recast_done = True
                         continue
-                    gap = CLICK_GAP - (time.monotonic() - last_click)
-                    if gap > 0:
-                        time.sleep(gap)
-                    click_at(disc["x"], disc["y"])
-                    disc["clicked"] = last_click = time.monotonic()
-                    debug_shot(f"{mode}_click", frame, discs, (disc["x"], disc["y"]))
-                    print(f"{mode}: click at ({disc['x']:.0f}, {disc['y']:.0f})")
+                    last_mode_time = now
+                    recast_done = False
 
-                time.sleep(0.005)
+                    # Match each disc to the one seen nearest to it last frame.
+                    match_dist = ANYTIME_DISC_R * frame.shape[0]
+                    still_there = []
+                    for x, y in discs:
+                        old = min(tracked, default=None,
+                                  key=lambda d: (d["x"] - x) ** 2 + (d["y"] - y) ** 2)
+                        if old and (old["x"] - x) ** 2 + (old["y"] - y) ** 2 < match_dist ** 2:
+                            tracked.remove(old)
+                            old["x"], old["y"] = x, y
+                            still_there.append(old)
+                        else:
+                            still_there.append({"x": x, "y": y, "first": now, "clicked": -1e9})
+                    tracked = still_there
+
+                    for disc in sorted(tracked, key=lambda d: d["first"]):
+                        if now - disc["clicked"] < RECLICK_AFTER:
+                            continue
+                        gap = CLICK_GAP - (time.monotonic() - last_click)
+                        if gap > 0:
+                            time.sleep(gap)
+                        click_at(ox + disc["x"], oy + disc["y"])
+                        disc["clicked"] = last_click = time.monotonic()
+                        debug_shot(f"{mode}_click", frame, discs, (disc["x"], disc["y"]))
+                        print(f"{mode}: click at ({ox + disc['x']:.0f}, {oy + disc['y']:.0f})")
+
+                    time.sleep(0.005)
+                except Exception:
+                    traceback.print_exc()   # keep going instead of dying silently
+                    time.sleep(1)
 
 
 def on_press(key):
