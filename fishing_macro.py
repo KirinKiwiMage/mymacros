@@ -46,7 +46,8 @@ COLOR_DIFF = 110         # any time: how far a pixel's colour must be from the t
 ANYTIME_FIRST_DELAY = 0.05  # wait after a disc first appears before clicking it
 RECLICK_AFTER = 0.40        # click the same spot again if the disc is still there
 CLICK_GAP = 0.04            # minimum time between two clicks
-MOVE_SETTLE = 0.015         # time between moving the mouse and clicking
+MOVE_SETTLE = 0.035         # time between moving the mouse and pressing (~2 game frames)
+CLICK_HOLD = 0.035          # how long the button is held down (~2 game frames)
 
 # Re-cast the rod by clicking once after a minigame ends. Off by default -
 # turn on if the game doesn't re-cast by itself.
@@ -147,10 +148,14 @@ class Screen:
 
 
 def click_at(x, y):
+    # Roblox reads input once per frame, so give it a frame or two to see the
+    # move and the press; an instant press+release can be missed entirely.
     clicker.position = (x + 1, y)   # tiny wiggle so the game registers the move
     clicker.position = (x, y)
     time.sleep(MOVE_SETTLE)
-    clicker.click(mouse.Button.left)
+    clicker.press(mouse.Button.left)
+    time.sleep(CLICK_HOLD)
+    clicker.release(mouse.Button.left)
 
 
 def macro_loop():
@@ -158,8 +163,7 @@ def macro_loop():
         while not quitting.is_set():
             if not running.wait(0.1):
                 continue
-            first_seen = {}          # (grid x, grid y) -> time a disc appeared there
-            clicked = {}             # (grid x, grid y) -> time we last clicked there
+            tracked = []             # discs on screen: {"x", "y", "first", "clicked"}
             last_mode_time = None
             recast_done = True
             last_click = -1e9
@@ -170,7 +174,7 @@ def macro_loop():
                 mode, discs = detect(frame)
 
                 if mode is None:
-                    first_seen.clear()
+                    tracked.clear()
                     if (AUTO_RECAST and not recast_done and last_mode_time
                             and now - last_mode_time >= RECAST_DELAY + LENIENCY):
                         print("re-casting")
@@ -180,26 +184,31 @@ def macro_loop():
                 last_mode_time = now
                 recast_done = False
 
-                # Discs are matched between frames by a coarse grid position.
-                grid = ANYTIME_DISC_R * frame.shape[0]
-                keys = {(round(x / grid), round(y / grid)): (x, y) for x, y in discs}
-                for key in list(first_seen):
-                    if key not in keys:
-                        del first_seen[key]
-                for key in keys:
-                    first_seen.setdefault(key, now)
+                # Match each disc to the one seen nearest to it last frame.
+                match_dist = ANYTIME_DISC_R * frame.shape[0]
+                still_there = []
+                for x, y in discs:
+                    old = min(tracked, default=None,
+                              key=lambda d: (d["x"] - x) ** 2 + (d["y"] - y) ** 2)
+                    if old and (old["x"] - x) ** 2 + (old["y"] - y) ** 2 < match_dist ** 2:
+                        tracked.remove(old)
+                        old["x"], old["y"] = x, y
+                        still_there.append(old)
+                    else:
+                        still_there.append({"x": x, "y": y, "first": now, "clicked": -1e9})
+                tracked = still_there
 
-                for key, (x, y) in sorted(keys.items(), key=lambda kv: first_seen[kv[0]]):
-                    if mode == "anytime" and now - first_seen[key] < ANYTIME_FIRST_DELAY:
+                for disc in sorted(tracked, key=lambda d: d["first"]):
+                    if mode == "anytime" and now - disc["first"] < ANYTIME_FIRST_DELAY:
                         continue
-                    if now - clicked.get(key, -1e9) < RECLICK_AFTER:
+                    if now - disc["clicked"] < RECLICK_AFTER:
                         continue
                     gap = CLICK_GAP - (time.monotonic() - last_click)
                     if gap > 0:
                         time.sleep(gap)
-                    click_at(x, y)
-                    clicked[key] = last_click = time.monotonic()
-                    print(f"{mode}: click at ({x:.0f}, {y:.0f})")
+                    click_at(disc["x"], disc["y"])
+                    disc["clicked"] = last_click = time.monotonic()
+                    print(f"{mode}: click at ({disc['x']:.0f}, {disc['y']:.0f})")
 
                 time.sleep(0.005)
 
