@@ -102,7 +102,7 @@ def check_sober():
         sys.exit(f"{APP_ID} isn't installed. Run: flatpak install flathub {APP_ID}")
 
 
-def launch(names, extra_args):
+def launch(names, extra_args, share_ipc=False):
     check_sober()
     for i, name in enumerate(names):
         if i:
@@ -110,7 +110,11 @@ def launch(names, extra_args):
         root, new = ensure_profile(name)
         log = open(os.path.join(root, "sober.log"), "ab")
         # New session so closing this terminal doesn't kill the instances.
-        proc = subprocess.Popen(["flatpak", "run", APP_ID, *extra_args],
+        # Sober shares the host's IPC namespace (SysV shm/semaphores), and a
+        # second instance there trips its "frozen instance" check. Give each
+        # instance its own.
+        flags = [] if share_ipc else ["--unshare=ipc"]
+        proc = subprocess.Popen(["flatpak", "run", *flags, APP_ID, *extra_args],
                                 env=flatpak_env(root), cwd=root,
                                 stdout=log, stderr=subprocess.STDOUT,
                                 stdin=subprocess.DEVNULL, start_new_session=True)
@@ -272,6 +276,26 @@ def diagnose():
     # The sandbox's view of the filesystem: the innermost bwrap we can read.
     root = next((f"/proc/{p}/root" for p in reversed(pids)
                  if os.path.exists(f"/proc/{p}/root/.flatpak-info")), f"/proc/{pids[0]}/root")
+    # Shared with the host unless --unshare=ipc / no network: SysV IPC and
+    # abstract unix sockets are where a cross-instance check could hide.
+    for kind in ("shm", "sem", "msg"):
+        try:
+            with open(f"/proc/sysvipc/{kind}") as f:
+                rows = f.read().splitlines()
+        except OSError as e:
+            rows = [f"<{e.strerror}>"]
+        out += [f"== sysv {kind} (host IPC namespace)"] + [f"  {r}" for r in rows]
+    try:
+        with open(f"/proc/{pids[-1]}/net/unix") as f:
+            names = sorted({c[7] for c in (l.split() for l in f.read().splitlines()[1:])
+                            if len(c) >= 8 and c[7].startswith("@")})
+    except OSError as e:
+        names = [f"<{e.strerror}>"]
+    out += ["== abstract unix sockets (shared network namespace)"] + [f"  {n}" for n in names]
+    try:
+        out += ["== sandbox /dev/shm"] + _ls(f"{root}/dev/shm")
+    except OSError:
+        pass
     out += [f"== sandbox /tmp"] + _ls(f"{root}/tmp")
     out += [f"== sandbox /run/user/{os.getuid()}"] + _ls(f"{root}/run/user/{os.getuid()}")
     out += [f"== sandbox /run/flatpak"] + _ls(f"{root}/run/flatpak", depth=1)
@@ -290,6 +314,8 @@ def main():
     pl = sub.add_parser("launch", help="start one instance per profile name")
     pl.add_argument("names", nargs="+",
                     help="profile names; args after -- go to Sober (e.g. a roblox:// link)")
+    pl.add_argument("--share-ipc", action="store_true",
+                    help="don't give instances their own IPC namespace (if graphics break)")
     sub.add_parser("list", help="list profiles")
     pr = sub.add_parser("remove", help="delete profiles")
     pr.add_argument("names", nargs="+")
@@ -304,7 +330,7 @@ def main():
     args = p.parse_args(argv)
 
     if args.cmd == "launch":
-        launch(args.names, extra)
+        launch(args.names, extra, args.share_ipc)
     elif args.cmd == "list":
         list_profiles()
     elif args.cmd == "remove":
