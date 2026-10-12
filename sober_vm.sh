@@ -14,15 +14,22 @@
 #   ./sober_vm.sh create [name]     # download Ubuntu + build the VM (once)
 #   ./sober_vm.sh start  [name]     # boot it; first boot installs Sober (~15 min)
 #   ./sober_vm.sh ssh    [name]     # shell into the VM (for logs)
+#   ./sober_vm.sh update [name]     # apply in-VM fixes to a VM made earlier
 #   ./sober_vm.sh delete [name]     # remove the VM
 #
 # start options:
 #   --stealth         hide the "running under a hypervisor" CPU flag and QEMU
 #                     hardware names, if Sober refuses to run in a VM
 #   --sdl             use QEMU's SDL window instead of GTK (if GTK+GL fails)
-#   --relative-mouse  no absolute tablet pointer; click into the window to
-#                     grab the mouse (Ctrl+Alt+G releases). Try if camera
-#                     turning in-game misbehaves.
+#   --res WxH         VM screen size (default 1600x900, or your screen's size
+#                     with --fullscreen)
+#   --fullscreen      run the VM window fullscreen (Ctrl+Alt+F toggles)
+#   --tablet          absolute "tablet" pointer instead of a normal mouse: no
+#                     need to click in to grab it, but Roblox's camera turns
+#                     wildly fast with it
+#
+# The mouse is captured when you click into the VM window; Ctrl+Alt+G
+# releases it.
 #
 # Default name is "alt". Tweak with env vars: SOBER_VM_RAM (MiB, default
 # 6144), SOBER_VM_CPUS (default 4), SOBER_VM_DISK (default 40G).
@@ -37,6 +44,34 @@ CPUS="${SOBER_VM_CPUS:-4}"
 DISK="${SOBER_VM_DISK:-40G}"
 
 die() { echo "sober_vm: $*" >&2; exit 1; }
+
+# Runs inside the VM as user "sober" (from cloud-init on new VMs, over SSH
+# for `update`). Makes Sober's game window borderless fullscreen on the VM
+# screen, so it isn't an 800x600 window in a corner.
+guest_setup() {
+    cat <<'EOF'
+#!/bin/bash
+set -e
+mkdir -p ~/.config/openbox
+python3 - <<'PY'
+import os
+xml = open("/etc/xdg/openbox/rc.xml").read()
+rule = """  <application class="org.vinegarhq.Sober" type="normal">
+    <decor>no</decor>
+    <fullscreen>yes</fullscreen>
+  </application>
+"""
+if 'class="org.vinegarhq.Sober"' not in xml:
+    if "</applications>" in xml:
+        xml = xml.replace("</applications>", rule + "</applications>", 1)
+    else:
+        xml = xml.replace("</openbox_config>",
+                          "<applications>\n" + rule + "</applications>\n</openbox_config>", 1)
+open(os.path.expanduser("~/.config/openbox/rc.xml"), "w").write(xml)
+PY
+echo "Sober VM setup applied."
+EOF
+}
 
 vm_dir() {
     local name="${1:-alt}"
@@ -94,6 +129,10 @@ packages:
   - python3
 
 write_files:
+  - path: /usr/local/bin/sober-vm-setup
+    permissions: "0755"
+    content: |
+@@GUEST_SETUP@@
   # Log in automatically on the first console...
   - path: /etc/systemd/system/getty@tty1.service.d/autologin.conf
     content: |
@@ -140,6 +179,7 @@ runcmd:
   - [bash, -c, "apt-get install -y linux-modules-extra-$(uname -r) || true"]
   - [flatpak, remote-add, --if-not-exists, flathub, "https://dl.flathub.org/repo/flathub.flatpakrepo"]
   - [flatpak, install, -y, --noninteractive, flathub, org.vinegarhq.Sober]
+  - [sudo, -u, sober, -H, /usr/local/bin/sober-vm-setup]
 
 power_state:
   mode: reboot
@@ -147,6 +187,16 @@ power_state:
   condition: true
 EOF
     sed -i "s|@@PASSWORD@@|$password|" "$dir/user-data"
+    # Splice in the setup script, indented to sit inside "content: |".
+    local tmp="$dir/user-data.tmp"
+    while IFS= read -r line; do
+        if [[ "$line" == "@@GUEST_SETUP@@" ]]; then
+            guest_setup | sed 's/^/      /'
+        else
+            printf '%s\n' "$line"
+        fi
+    done < "$dir/user-data" > "$tmp"
+    mv "$tmp" "$dir/user-data"
     cloud-localds "$dir/seed.iso" "$dir/user-data" "$dir/meta-data"
 }
 
@@ -183,16 +233,36 @@ cmd_create() {
 }
 
 cmd_start() {
-    local name="alt" stealth=0 display="gtk,gl=on" tablet=1
-    for a in "$@"; do
-        case "$a" in
+    local name="alt" stealth=0 sdl=0 tablet=0 fullscreen=0 res=""
+    while (( $# )); do
+        case "$1" in
             --stealth) stealth=1 ;;
-            --sdl) display="sdl,gl=on" ;;
-            --relative-mouse) tablet=0 ;;
-            -*) die "unknown option $a" ;;
-            *) name="$a" ;;
+            --sdl) sdl=1 ;;
+            --tablet) tablet=1 ;;
+            --relative-mouse) ;;  # the default now
+            --fullscreen) fullscreen=1 ;;
+            --res) shift; res="${1:-}" ;;
+            --res=*) res="${1#--res=}" ;;
+            -*) die "unknown option $1" ;;
+            *) name="$1" ;;
         esac
+        shift
     done
+    if [[ -z "$res" ]]; then
+        res=1600x900
+        if (( fullscreen )); then
+            res="$(xrandr --current 2>/dev/null | awk '/\*/ {print $1; exit}')"
+            [[ -n "$res" ]] || res=1920x1080
+        fi
+    fi
+    [[ "$res" =~ ^([0-9]+)x([0-9]+)$ ]] || die "bad --res '$res' (want e.g. 1920x1080)"
+    local xres="${BASH_REMATCH[1]}" yres="${BASH_REMATCH[2]}"
+    # No zoom-to-fit: resizing the window must not stretch (or resize) the
+    # VM's screen under a running game.
+    local display="gtk,gl=on,zoom-to-fit=off"
+    (( sdl )) && display="sdl,gl=on"
+    local extra=()
+    (( fullscreen )) && extra+=(-full-screen)
     local dir
     dir="$(vm_dir "$name")"
     [[ -f "$dir/disk.qcow2" ]] || die "no VM '$name': run ./sober_vm.sh create $name"
@@ -205,6 +275,9 @@ cmd_start() {
         smbios=(-smbios "type=1,manufacturer=Generic,product=Desktop,version=1.0"
                 -smbios "type=2,manufacturer=Generic,product=Desktop")
     fi
+    # A tablet reports absolute positions; Roblox reads raw mouse motion for
+    # the camera, and absolute values (0-32767) make it spin wildly. The
+    # default PS/2 mouse is relative: click in to grab, Ctrl+Alt+G releases.
     local input=()
     (( tablet )) && input=(-device usb-tablet)
 
@@ -217,7 +290,7 @@ cmd_start() {
         -drive "file=$dir/disk.qcow2,if=virtio" \
         -drive "file=$dir/seed.iso,format=raw,if=virtio,readonly=on" \
         -nic "user,model=virtio-net-pci,hostfwd=tcp:127.0.0.1:$(cat "$dir/ssh_port")-:22" \
-        -device virtio-vga-gl -display "$display" \
+        -device "virtio-vga-gl,xres=$xres,yres=$yres" -display "$display" "${extra[@]}" \
         -audiodev pa,id=snd0 -device intel-hda -device hda-duplex,audiodev=snd0 \
         -device qemu-xhci "${input[@]}"
 }
@@ -229,6 +302,17 @@ cmd_ssh() {
     echo "Password: $(cat "$dir/password.txt")"
     exec ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
         -p "$(cat "$dir/ssh_port")" sober@127.0.0.1
+}
+
+cmd_update() {
+    local dir
+    dir="$(vm_dir "${1:-alt}")"
+    [[ -f "$dir/ssh_port" ]] || die "no VM '${1:-alt}'"
+    echo "Applying in-VM fixes to '${1:-alt}' (VM must be running)."
+    echo "Password: $(cat "$dir/password.txt")"
+    guest_setup | ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+        -p "$(cat "$dir/ssh_port")" sober@127.0.0.1 'bash -s'
+    echo "Done. Shut the VM down and start it again to use it."
 }
 
 cmd_delete() {
@@ -244,6 +328,7 @@ case "${1:-}" in
     create) shift; cmd_create "$@" ;;
     start) shift; cmd_start "$@" ;;
     ssh) shift; cmd_ssh "$@" ;;
+    update) shift; cmd_update "$@" ;;
     delete) shift; cmd_delete "$@" ;;
     *) sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac
