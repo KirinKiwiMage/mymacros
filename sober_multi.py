@@ -3,14 +3,15 @@
 Multi-Sober: run several Sober (Roblox on Linux) instances at once, each
 logged into its own account. Linux take on "multi-roblox" for Windows.
 
-Multi-roblox on Windows works by holding Roblox's singleton mutex. Sober is
-a Flatpak, so this script gives each instance its own profile instead:
-separate XDG data/config/cache dirs and HOME. Each profile has its own login, its
-own settings and its own Sober state, so the instances don't see each other.
+Multi-roblox on Windows works by holding Roblox's singleton mutex. Sober's
+equivalent is an exclusive lock on its Roblox APK inside
+~/.var/app/org.vinegarhq.Sober, and it ignores HOME/XDG_* set inside the
+sandbox. So each profile is a fake home folder that `flatpak run` itself is
+started with: Flatpak then mounts <profile>/.var/app/org.vinegarhq.Sober as
+Sober's folder, and every instance gets its own APK, lock, login and settings.
 
-Profiles live inside Sober's own Flatpak folder so the sandbox can always
-reach them:
-    ~/.var/app/org.vinegarhq.Sober/profiles/<name>/{data,config,cache,home}
+Profiles live in:
+    ~/.local/share/sober-multi/<name>/      (fake HOME for that instance)
 
 Usage:
     python3 sober_multi.py launch alt1 alt2 alt3   # start one instance per profile
@@ -20,13 +21,12 @@ Usage:
     python3 sober_multi.py diagnose                # with Sober open: show its
                                                    # locks/sockets/temp files
 
-The first launch of a new profile downloads Roblox again and asks you to
-log in. After that the login sticks. Your normal Sober (plain
+A new profile copies your normal Sober's config.json and downloaded Roblox
+files (so it doesn't download them again), but not your login: log in once
+per profile, after that it sticks. Your normal Sober (plain
 `flatpak run org.vinegarhq.Sober`) is left untouched and can run alongside.
-New profiles copy your normal Sober config.json, so settings like FPS
-carry over; logins don't.
 
-Each instance's output goes to <profile>/sober.log.
+Each instance's output goes to ~/.local/share/sober-multi/<name>/sober.log.
 
 Requires: Sober installed from Flathub (flatpak install flathub org.vinegarhq.Sober)
 """
@@ -40,9 +40,10 @@ import sys
 import time
 
 APP_ID = "org.vinegarhq.Sober"
-APP_DIR = os.path.expanduser(f"~/.var/app/{APP_ID}")
-PROFILES_DIR = os.path.join(APP_DIR, "profiles")
-DEFAULT_CONFIG = os.path.join(APP_DIR, "config", "sober", "config.json")
+REAL_HOME = os.path.expanduser("~")
+APP_DIR = os.path.join(REAL_HOME, ".var", "app", APP_ID)
+PROFILES_DIR = os.path.join(REAL_HOME, ".local", "share", "sober-multi")
+APP_SUBDIR = os.path.join(".var", "app", APP_ID)  # inside each profile
 
 # Gap between launches so instances don't fight over first-run setup.
 # Includes a little leniency for slow disks / lag spikes.
@@ -59,14 +60,38 @@ def profile_dir(name):
 
 def ensure_profile(name):
     root = profile_dir(name)
-    new = not os.path.isdir(root)
-    for sub in ("data", "config", "cache", "home"):
-        os.makedirs(os.path.join(root, sub), exist_ok=True)
-    if new and os.path.isfile(DEFAULT_CONFIG):
-        dst = os.path.join(root, "config", "sober")
-        os.makedirs(dst, exist_ok=True)
-        shutil.copy2(DEFAULT_CONFIG, dst)
-    return root, new
+    app = os.path.join(root, APP_SUBDIR)
+    new = not os.path.isdir(app)
+    if not new:
+        return root, False
+    os.makedirs(app)
+    # Seed from the normal Sober: settings and the downloaded Roblox APKs.
+    # Real copies, not hardlinks: Sober's instance lock is on the APK, and a
+    # hardlink would share the lock with the original.
+    for rel in (("config", "sober", "config.json"), ("data", "sober", "packages")):
+        src = os.path.join(APP_DIR, *rel)
+        dst = os.path.join(app, *rel)
+        if os.path.isfile(src):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.copy2(src, dst)
+        elif os.path.isdir(src):
+            print(f"[{name}] copying Roblox files from your normal Sober...")
+            shutil.copytree(src, dst, symlinks=True)
+    return root, True
+
+
+def flatpak_env(fake_home):
+    """Host env for `flatpak run` with HOME swapped to the profile, keeping
+    everything flatpak itself still needs from the real home."""
+    env = dict(os.environ, HOME=fake_home)
+    # Sober may be a --user install, which flatpak finds via HOME.
+    env.setdefault("FLATPAK_USER_DIR", os.path.join(
+        os.environ.get("XDG_DATA_HOME") or os.path.join(REAL_HOME, ".local", "share"), "flatpak"))
+    # X11 auth cookie defaults to ~/.Xauthority when XAUTHORITY isn't set.
+    xauth = os.path.join(REAL_HOME, ".Xauthority")
+    if "XAUTHORITY" not in env and os.path.isfile(xauth):
+        env["XAUTHORITY"] = xauth
+    return env
 
 
 def check_sober():
@@ -83,19 +108,11 @@ def launch(names, extra_args):
         if i:
             time.sleep(LAUNCH_GAP)
         root, new = ensure_profile(name)
-        cmd = [
-            "flatpak", "run",
-            f"--env=XDG_DATA_HOME={root}/data",
-            f"--env=XDG_CONFIG_HOME={root}/config",
-            f"--env=XDG_CACHE_HOME={root}/cache",
-            # Sober's "already running" lock isn't under the XDG dirs, so
-            # give each instance its own HOME too.
-            f"--env=HOME={root}/home",
-            APP_ID, *extra_args,
-        ]
         log = open(os.path.join(root, "sober.log"), "ab")
         # New session so closing this terminal doesn't kill the instances.
-        proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT,
+        proc = subprocess.Popen(["flatpak", "run", APP_ID, *extra_args],
+                                env=flatpak_env(root), cwd=root,
+                                stdout=log, stderr=subprocess.STDOUT,
                                 stdin=subprocess.DEVNULL, start_new_session=True)
         log.close()
         note = " (new profile: log in once)" if new else ""
