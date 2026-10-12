@@ -342,6 +342,16 @@ cmd_update() {
 guest_logs() {
     cat <<'EOF'
 echo "== uptime / memory"; uptime; free -m
+echo; echo "== recent boots / reboots / shutdowns"
+journalctl --list-boots --no-pager 2>/dev/null | tail -n 6
+last -x reboot shutdown 2>/dev/null | head -n 8
+echo; echo "== how the previous boot ended (last 60 lines of its journal)"
+sudo journalctl -b -1 -n 60 --no-pager 2>/dev/null || echo "(no previous boot in the journal)"
+echo; echo "== previous boot: errors"
+sudo journalctl -b -1 -p err --no-pager 2>/dev/null | tail -n 40
+echo; echo "== cloud-init (should be 'done', once)"
+cloud-init status --long 2>/dev/null | head -n 6
+ls /var/lib/cloud/instances 2>/dev/null
 echo; echo "== Sober exits (newest last)"
 tail -n 30 ~/sober-restarts.log 2>/dev/null || echo "(none logged yet: run ./sober_vm.sh update first)"
 echo; echo "== kernel: out-of-memory kills / GPU errors this boot"
