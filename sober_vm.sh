@@ -17,6 +17,9 @@
 #   ./sober_vm.sh update [name]     # apply in-VM fixes to a VM made earlier
 #   ./sober_vm.sh delete [name]     # remove the VM
 #
+# While a VM runs, $SOBER_VM_DIR/<name>/qmp.sock is QEMU's control socket;
+# vm_q_spam.py uses it to type into the VM without it having focus.
+#
 # start options:
 #   --stealth         hide the "running under a hypervisor" CPU flag and QEMU
 #                     hardware names, if Sober refuses to run in a VM
@@ -292,7 +295,8 @@ cmd_start() {
         -nic "user,model=virtio-net-pci,hostfwd=tcp:127.0.0.1:$(cat "$dir/ssh_port")-:22" \
         -device "virtio-vga-gl,xres=$xres,yres=$yres" -display "$display" "${extra[@]}" \
         -audiodev pa,id=snd0 -device intel-hda -device hda-duplex,audiodev=snd0 \
-        -device qemu-xhci "${input[@]}"
+        -device qemu-xhci "${input[@]}" \
+        -qmp "unix:$dir/qmp.sock,server=on,wait=off"
 }
 
 cmd_ssh() {
