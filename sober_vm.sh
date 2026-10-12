@@ -352,6 +352,12 @@ sudo journalctl -b -1 -p err --no-pager 2>/dev/null | tail -n 40
 echo; echo "== cloud-init (should be 'done', once)"
 cloud-init status --long 2>/dev/null | head -n 6
 ls /var/lib/cloud/instances 2>/dev/null
+echo; echo "== Sober launches this boot (one systemd scope per 'flatpak run')"
+journalctl --user -b --no-pager 2>/dev/null | grep -E "app-flatpak-org.vinegarhq.Sober-[0-9]+.scope" | tail -n 20
+echo; echo "== Roblox sessions (one log file per launch, newest last)"
+ls -ltr --time-style=+%T ~/.var/app/org.vinegarhq.Sober/data/sober/appData/logs/ 2>/dev/null | tail -n 12
+echo; echo "== restart loop in ~/.xinitrc (should log exits)"
+sed -n '/while true/,/done/p' ~/.xinitrc
 echo; echo "== Sober exits (newest last)"
 tail -n 30 ~/sober-restarts.log 2>/dev/null || echo "(none logged yet: run ./sober_vm.sh update first)"
 echo; echo "== kernel: out-of-memory kills / GPU errors this boot"
