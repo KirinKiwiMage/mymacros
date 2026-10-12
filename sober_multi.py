@@ -5,12 +5,12 @@ logged into its own account. Linux take on "multi-roblox" for Windows.
 
 Multi-roblox on Windows works by holding Roblox's singleton mutex. Sober is
 a Flatpak, so this script gives each instance its own profile instead:
-separate XDG data/config/cache dirs. Each profile has its own login, its
+separate XDG data/config/cache dirs and HOME. Each profile has its own login, its
 own settings and its own Sober state, so the instances don't see each other.
 
 Profiles live inside Sober's own Flatpak folder so the sandbox can always
 reach them:
-    ~/.var/app/org.vinegarhq.Sober/profiles/<name>/{data,config,cache}
+    ~/.var/app/org.vinegarhq.Sober/profiles/<name>/{data,config,cache,home}
 
 Usage:
     python3 sober_multi.py launch alt1 alt2 alt3   # start one instance per profile
@@ -60,7 +60,7 @@ def profile_dir(name):
 def ensure_profile(name):
     root = profile_dir(name)
     new = not os.path.isdir(root)
-    for sub in ("data", "config", "cache"):
+    for sub in ("data", "config", "cache", "home"):
         os.makedirs(os.path.join(root, sub), exist_ok=True)
     if new and os.path.isfile(DEFAULT_CONFIG):
         dst = os.path.join(root, "config", "sober")
@@ -88,6 +88,9 @@ def launch(names, extra_args):
             f"--env=XDG_DATA_HOME={root}/data",
             f"--env=XDG_CONFIG_HOME={root}/config",
             f"--env=XDG_CACHE_HOME={root}/cache",
+            # Sober's "already running" lock isn't under the XDG dirs, so
+            # give each instance its own HOME too.
+            f"--env=HOME={root}/home",
             APP_ID, *extra_args,
         ]
         log = open(os.path.join(root, "sober.log"), "ab")
@@ -158,6 +161,29 @@ def _ls(path, depth=2, indent="  "):
     return lines
 
 
+def _find_inodes(wanted):
+    """Fill in paths for {(major, minor, inode): None}, searching Sober's
+    Flatpak dir first, then the rest of home (same disk only)."""
+    def walk(top, skip=None):
+        for dirpath, dirnames, filenames in os.walk(top):
+            if skip:
+                dirnames[:] = [d for d in dirnames if os.path.join(dirpath, d) != skip]
+            for name in dirnames + filenames:
+                full = os.path.join(dirpath, name)
+                try:
+                    st = os.lstat(full)
+                except OSError:
+                    continue
+                key = (os.major(st.st_dev), os.minor(st.st_dev), st.st_ino)
+                if key in wanted and wanted[key] is None:
+                    wanted[key] = full
+                    if all(wanted.values()):
+                        return True
+        return False
+    if wanted and not walk(APP_DIR):
+        walk(os.path.expanduser("~"), skip=APP_DIR)
+
+
 def diagnose():
     """Dump how a running Sober could be spotting other instances: open
     files, file locks, unix sockets, D-Bus names, temp/runtime dirs."""
@@ -181,6 +207,7 @@ def diagnose():
             locks = f.read().splitlines()
     except OSError:
         locks = []
+    held = {}  # (major, minor, inode) of locked files -> path
     for pid in pids:
         try:
             with open(f"/proc/{pid}/comm") as f:
@@ -212,9 +239,22 @@ def diagnose():
                         out.append(f"  unix socket {cols[7]}")
         except OSError:
             pass
-        out += [f"  lock {l}" for l in locks if f" {pid} " in l]
+        for l in locks:
+            cols = l.split()
+            if len(cols) >= 6 and cols[4] == str(pid):
+                out.append(f"  lock {l}")
+                major, minor, ino = cols[5].split(":")
+                if int(major, 16):  # 0 = virtual fs (/proc etc.), skip
+                    held[(int(major, 16), int(minor, 16), int(ino))] = None
 
-    root = f"/proc/{pids[0]}/root"
+    out.append("== locked files (Sober hides its fds, so look them up by inode)")
+    _find_inodes(held)
+    for (major, minor, ino), path in held.items():
+        out.append(f"  {major:x}:{minor:02x}:{ino} -> {path or '(not found under home)'}")
+
+    # The sandbox's view of the filesystem: the innermost bwrap we can read.
+    root = next((f"/proc/{p}/root" for p in reversed(pids)
+                 if os.path.exists(f"/proc/{p}/root/.flatpak-info")), f"/proc/{pids[0]}/root")
     out += [f"== sandbox /tmp"] + _ls(f"{root}/tmp")
     out += [f"== sandbox /run/user/{os.getuid()}"] + _ls(f"{root}/run/user/{os.getuid()}")
     out += [f"== sandbox /run/flatpak"] + _ls(f"{root}/run/flatpak", depth=1)
