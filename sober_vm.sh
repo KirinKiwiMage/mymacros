@@ -15,6 +15,7 @@
 #   ./sober_vm.sh start  [name]     # boot it; first boot installs Sober (~15 min)
 #   ./sober_vm.sh ssh    [name]     # shell into the VM (for logs)
 #   ./sober_vm.sh update [name]     # apply in-VM fixes to a VM made earlier
+#   ./sober_vm.sh logs   [name]     # why did Sober restart? -> ~/sober_vm_logs.txt
 #   ./sober_vm.sh delete [name]     # remove the VM
 #
 # While a VM runs, $SOBER_VM_DIR/<name>/qmp.sock is QEMU's control socket;
@@ -71,6 +72,19 @@ if 'class="org.vinegarhq.Sober"' not in xml:
         xml = xml.replace("</openbox_config>",
                           "<applications>\n" + rule + "</applications>\n</openbox_config>", 1)
 open(os.path.expanduser("~/.config/openbox/rc.xml"), "w").write(xml)
+PY
+# VMs made before Sober exits were logged: patch the restart loop.
+python3 - <<'PY'
+import os
+p = os.path.expanduser("~/.xinitrc")
+x = open(p).read()
+old = "    flatpak run org.vinegarhq.Sober\n"
+new = ("    [ -f ~/sober-last.log ] && mv ~/sober-last.log ~/sober-prev.log\n"
+       "    flatpak run org.vinegarhq.Sober > ~/sober-last.log 2>&1\n"
+       "    rc=$?\n"
+       "    echo \"$(date '+%F %T') Sober exited with code $rc\" >> ~/sober-restarts.log\n")
+if old in x:
+    open(p, "w").write(x.replace(old, new, 1))
 PY
 echo "Sober VM setup applied."
 EOF
@@ -172,8 +186,13 @@ write_files:
       json.dump(cfg, open(p, "w"), indent=4)
       PY
       # Reopen Sober if it's closed; shut the VM down from its window to stop.
+      # Each run's output is kept (the one before a restart as sober-prev.log)
+      # and every exit is logged, for `./sober_vm.sh logs`.
       while true; do
-          flatpak run org.vinegarhq.Sober
+          [ -f ~/sober-last.log ] && mv ~/sober-last.log ~/sober-prev.log
+          flatpak run org.vinegarhq.Sober > ~/sober-last.log 2>&1
+          rc=$?  # before $(date) below resets $?
+          echo "$(date '+%F %T') Sober exited with code $rc" >> ~/sober-restarts.log
           sleep 3
       done
 
@@ -319,6 +338,35 @@ cmd_update() {
     echo "Done. Shut the VM down and start it again to use it."
 }
 
+# Runs inside the VM for `logs`: why did Sober restart?
+guest_logs() {
+    cat <<'EOF'
+echo "== uptime / memory"; uptime; free -m
+echo; echo "== Sober exits (newest last)"
+tail -n 30 ~/sober-restarts.log 2>/dev/null || echo "(none logged yet: run ./sober_vm.sh update first)"
+echo; echo "== kernel: out-of-memory kills / GPU errors this boot"
+sudo journalctl -k -b --no-pager 2>/dev/null \
+    | grep -iE "out of memory|oom-kill|killed process|virtio_gpu|drm.*error|segfault" | tail -n 30
+echo; echo "== output of the Sober run before the last restart (last 200 lines)"
+tail -n 200 ~/sober-prev.log 2>/dev/null || echo "(none)"
+echo; echo "== newest Roblox logs (last 80 lines each)"
+for f in $(ls -t ~/.var/app/org.vinegarhq.Sober/data/sober/appData/logs/*.log 2>/dev/null | head -n 2); do
+    echo "-- $f"; tail -n 80 "$f"
+done
+EOF
+}
+
+cmd_logs() {
+    local dir out="$HOME/sober_vm_logs.txt"
+    dir="$(vm_dir "${1:-alt}")"
+    [[ -f "$dir/ssh_port" ]] || die "no VM '${1:-alt}'"
+    echo "Collecting logs from '${1:-alt}' (VM must be running)."
+    echo "Password: $(cat "$dir/password.txt")"
+    guest_logs | ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+        -p "$(cat "$dir/ssh_port")" sober@127.0.0.1 'bash -s' > "$out"
+    echo "Saved to $out"
+}
+
 cmd_delete() {
     local dir
     dir="$(vm_dir "${1:-alt}")"
@@ -333,6 +381,7 @@ case "${1:-}" in
     start) shift; cmd_start "$@" ;;
     ssh) shift; cmd_ssh "$@" ;;
     update) shift; cmd_update "$@" ;;
+    logs) shift; cmd_logs "$@" ;;
     delete) shift; cmd_delete "$@" ;;
     *) sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac
