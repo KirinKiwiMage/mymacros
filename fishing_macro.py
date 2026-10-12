@@ -20,15 +20,17 @@ Hotkeys:
     Numpad 8 - stop
     Ctrl+C in the terminal - quit
 
-Requires: pip install pynput python-xlib mss numpy   (X11 session)
+Requires: pynput, python-xlib and numpy   (X11 session)
+    sudo apt install python3-pynput python3-xlib python3-numpy
 """
 
 import threading
 import time
 
-import mss
 import numpy as np
 from pynput import keyboard, mouse
+from Xlib import X
+from Xlib.display import Display
 
 from numpad_hotkeys import is_start, is_stop
 
@@ -125,6 +127,25 @@ def detect(frame):
     return mode, [(x * STRIDE, y * STRIDE) for x, y in find_discs(mask, expected)]
 
 
+class Screen:
+    """Grabs screenshots of the whole X screen as RGB numpy arrays."""
+
+    def __enter__(self):
+        self.display = Display()
+        self.root = self.display.screen().root
+        geom = self.root.get_geometry()
+        self.width, self.height = geom.width, geom.height
+        return self
+
+    def grab(self):
+        image = self.root.get_image(0, 0, self.width, self.height, X.ZPixmap, 0xFFFFFFFF)
+        pixels = np.frombuffer(image.data, dtype=np.uint8)
+        return pixels.reshape(self.height, self.width, 4)[:, :, 2::-1]   # BGRX -> RGB
+
+    def __exit__(self, *_):
+        self.display.close()
+
+
 def click_at(x, y):
     clicker.position = (x + 1, y)   # tiny wiggle so the game registers the move
     clicker.position = (x, y)
@@ -133,9 +154,7 @@ def click_at(x, y):
 
 
 def macro_loop():
-    with mss.mss() as sct:
-        monitor = sct.monitors[1]   # primary screen
-        ox, oy = monitor["left"], monitor["top"]
+    with Screen() as screen:
         while not quitting.is_set():
             if not running.wait(0.1):
                 continue
@@ -146,7 +165,7 @@ def macro_loop():
             last_click = -1e9
 
             while running.is_set() and not quitting.is_set():
-                frame = np.asarray(sct.grab(monitor))[:, :, 2::-1]   # BGRA -> RGB
+                frame = screen.grab()
                 now = time.monotonic()
                 mode, discs = detect(frame)
 
@@ -155,7 +174,7 @@ def macro_loop():
                     if (AUTO_RECAST and not recast_done and last_mode_time
                             and now - last_mode_time >= RECAST_DELAY + LENIENCY):
                         print("re-casting")
-                        click_at(ox + frame.shape[1] // 2, oy + frame.shape[0] // 2)
+                        click_at(frame.shape[1] // 2, frame.shape[0] // 2)
                         recast_done = True
                     continue
                 last_mode_time = now
@@ -178,9 +197,9 @@ def macro_loop():
                     gap = CLICK_GAP - (time.monotonic() - last_click)
                     if gap > 0:
                         time.sleep(gap)
-                    click_at(ox + x, oy + y)
+                    click_at(x, y)
                     clicked[key] = last_click = time.monotonic()
-                    print(f"{mode}: click at ({ox + x:.0f}, {oy + y:.0f})")
+                    print(f"{mode}: click at ({x:.0f}, {y:.0f})")
 
                 time.sleep(0.005)
 
