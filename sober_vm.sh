@@ -86,7 +86,8 @@ new = ("    [ -f ~/sober-last.log ] && mv ~/sober-last.log ~/sober-prev.log\n"
 if old in x:
     open(p, "w").write(x.replace(old, new, 1))
 PY
-echo "Sober VM setup applied."
+echo "Sober VM setup applied. Restart loop is now:"
+sed -n '/while true/,/done/p' ~/.xinitrc
 EOF
 }
 
