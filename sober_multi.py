@@ -10,6 +10,11 @@ sandbox. So each profile is a fake home folder that `flatpak run` itself is
 started with: Flatpak then mounts <profile>/.var/app/org.vinegarhq.Sober as
 Sober's folder, and every instance gets its own APK, lock, login and settings.
 
+Sober also has a "frozen instance" check: byte-range locks on the time
+namespace file (/proc/self/ns/time), which every Flatpak sandbox shares.
+So each instance is also started in its own user + time namespace (no root
+needed, clocks unchanged), and its own IPC namespace.
+
 Profiles live in:
     ~/.local/share/sober-multi/<name>/      (fake HOME for that instance)
 
@@ -23,6 +28,7 @@ Usage:
     python3 sober_multi.py trace alt1 alt2         # launch + record Sober's D-Bus
 
 launch options:
+    --share-timens      don't give each instance its own time namespace
     --isolate-runtime   own /tmp and /run/user per profile (experimental)
     --share-ipc         don't give each instance its own IPC namespace
 
@@ -131,8 +137,48 @@ def check_sober():
         sys.exit(f"{APP_ID} isn't installed. Run: flatpak install flathub {APP_ID}")
 
 
-def launch(names, extra_args, share_ipc=False, isolate_runtime=False):
+CLONE_NEWUSER, CLONE_NEWTIME = 0x10000000, 0x80
+
+
+def timens_exec(argv):
+    """Exec argv in a new user + time namespace (no root needed). Sober's
+    "frozen instance" check holds byte-range locks on the time namespace
+    file, which every Flatpak sandbox shares, so two instances collide.
+    A fresh time namespace (zero clock offsets, same clocks) gives each
+    instance its own. Our uid/gid map to themselves, so files, D-Bus,
+    X11 and audio all still see the real user."""
+    import ctypes
+    uid, gid = os.getuid(), os.getgid()
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.unshare(CLONE_NEWUSER | CLONE_NEWTIME) != 0:
+        sys.exit(f"sober_multi: can't create a time namespace: {os.strerror(ctypes.get_errno())}")
+    try:
+        for path, data in (("setgroups", "deny"), ("uid_map", f"{uid} {uid} 1"),
+                           ("gid_map", f"{gid} {gid} 1")):
+            with open(f"/proc/self/{path}", "w") as f:
+                f.write(data)
+    except OSError as e:
+        sys.exit(f"sober_multi: can't set up the user namespace: {e}")
+    os.execvp(argv[0], argv)
+
+
+def timens_prefix():
+    return [sys.executable, os.path.abspath(__file__), "_timens"]
+
+
+def check_timens():
+    r = subprocess.run([*timens_prefix(), "true"], capture_output=True, text=True)
+    if r.returncode != 0:
+        sys.exit((r.stderr.strip() or "time namespace test failed") + "\n"
+                 "Your system blocks unprivileged user namespaces (Ubuntu 24.04+ AppArmor\n"
+                 "does this). Check: sysctl kernel.apparmor_restrict_unprivileged_userns\n"
+                 "Or run with --share-timens (second instance will hit 'frozen instance').")
+
+
+def launch(names, extra_args, share_ipc=False, isolate_runtime=False, share_timens=False):
     check_sober()
+    if not share_timens:
+        check_timens()
     for i, name in enumerate(names):
         if i:
             time.sleep(LAUNCH_GAP)
@@ -143,7 +189,8 @@ def launch(names, extra_args, share_ipc=False, isolate_runtime=False):
         # second instance there trips its "frozen instance" check. Give each
         # instance its own.
         flags = [] if share_ipc else ["--unshare=ipc"]
-        proc = subprocess.Popen(["flatpak", "run", *flags, APP_ID, *extra_args],
+        prefix = [] if share_timens else timens_prefix()
+        proc = subprocess.Popen([*prefix, "flatpak", "run", *flags, APP_ID, *extra_args],
                                 env=flatpak_env(root, fake_runtime(name) if isolate_runtime else None),
                                 cwd=root,
                                 stdout=log, stderr=subprocess.STDOUT,
@@ -330,7 +377,7 @@ def diagnose():
                 out.append("  sandbox flags: " + " ".join(a for a in argv if a.startswith("--unshare")))
             except OSError:
                 pass
-            for ns in ("ipc", "net", "pid"):
+            for ns in ("ipc", "net", "pid", "time"):
                 try:
                     out.append(f"  ns {os.readlink(f'/proc/{pid}/ns/{ns}')}")
                 except OSError:
@@ -489,6 +536,8 @@ def main():
                     help="profile names; args after -- go to Sober (e.g. a roblox:// link)")
     pl.add_argument("--share-ipc", action="store_true",
                     help="don't give instances their own IPC namespace (if graphics break)")
+    pl.add_argument("--share-timens", action="store_true",
+                    help="don't give each instance its own time namespace")
     pl.add_argument("--isolate-runtime", action="store_true",
                     help="give each profile its own /tmp and /run/user (experimental)")
     sub.add_parser("list", help="list profiles")
@@ -499,6 +548,8 @@ def main():
     pt.add_argument("names", nargs="*", default=["alt1", "alt2"])
     pt.add_argument("--seconds", type=int, default=60)
 
+    if sys.argv[1:2] == ["_timens"]:  # internal: see timens_exec()
+        timens_exec(sys.argv[2:])
     # argparse can't split "names... -- args" on its own.
     argv = sys.argv[1:]
     extra = []
@@ -508,7 +559,7 @@ def main():
     args = p.parse_args(argv)
 
     if args.cmd == "launch":
-        launch(args.names, extra, args.share_ipc, args.isolate_runtime)
+        launch(args.names, extra, args.share_ipc, args.isolate_runtime, args.share_timens)
     elif args.cmd == "list":
         list_profiles()
     elif args.cmd == "remove":
