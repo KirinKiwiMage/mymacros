@@ -86,6 +86,28 @@ new = ("    [ -f ~/sober-last.log ] && mv ~/sober-last.log ~/sober-prev.log\n"
 if old in x:
     open(p, "w").write(x.replace(old, new, 1))
 PY
+# Roblox in the VM gets put on a channel whose settings open a WebSocket to
+# a private Roblox address (10.110.101.222:5052) the VM can't reach. That
+# connect hangs 60 s, and Sober often exits cleanly right when it times
+# out, so reject it instantly instead. Undo:
+#   sudo systemctl disable --now sober-block-test-endpoint
+sudo tee /etc/systemd/system/sober-block-test-endpoint.service >/dev/null <<'UNIT' || true
+[Unit]
+Description=Fail fast on Roblox's unreachable internal test endpoint
+After=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'ip route replace prohibit 10.110.101.222/32'
+ExecStop=/bin/sh -c 'ip route del prohibit 10.110.101.222/32 || true'
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+sudo systemctl daemon-reload && sudo systemctl enable --now sober-block-test-endpoint \
+    && echo "Blocked 10.110.101.222: $(ip route get 10.110.101.222 2>&1 | head -n 1)" \
+    || echo "WARNING: couldn't set up the endpoint block"
 echo "Sober VM setup applied. Restart loop is now:"
 sed -n '/while true/,/done/p' ~/.xinitrc
 EOF
