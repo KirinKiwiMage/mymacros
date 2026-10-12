@@ -303,7 +303,12 @@ cmd_start() {
     local input=()
     (( tablet )) && input=(-device usb-tablet)
 
-    echo "Starting VM '$name'. First boot installs Sober and reboots (~15 min)."
+    echo "Starting VM '$name'."
+    # cloud-init's install + reboot only happens on the very first boot.
+    if [[ ! -e "$dir/started" ]]; then
+        echo "First boot: installs Sober, then reboots into it (~15 min)."
+        touch "$dir/started"
+    fi
     echo "SSH: ./sober_vm.sh ssh $name   (password in $dir/password.txt)"
     exec qemu-system-x86_64 \
         -name "sober-$name" \
