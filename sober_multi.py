@@ -20,6 +20,7 @@ Usage:
     python3 sober_multi.py remove alt1             # delete a profile (logs it out)
     python3 sober_multi.py diagnose                # with Sober open: show its
                                                    # locks/sockets/temp files
+    python3 sober_multi.py trace alt1 alt2         # launch + record Sober's D-Bus
 
 A new profile copies your normal Sober's config.json and downloaded Roblox
 files (so it doesn't download them again), but not your login: log in once
@@ -320,6 +321,79 @@ def diagnose():
     print(f"\nSaved to {path}")
 
 
+def _proxy_pids():
+    pids = set()
+    for d in os.listdir("/proc"):
+        if d.isdigit():
+            try:
+                with open(f"/proc/{d}/comm") as f:
+                    if f.read().strip() == "xdg-dbus-proxy":
+                        pids.add(int(d))
+            except OSError:
+                pass
+    return pids
+
+
+def trace(names, seconds):
+    """Record Sober's session D-Bus traffic while launching profiles.
+    Flatpak routes each sandbox's D-Bus through its own xdg-dbus-proxy, so
+    proxies that appear after we start belong to Sober; their bus
+    connections are Sober's. Only those messages are kept."""
+    if shutil.which("dbus-monitor") is None:
+        sys.exit("dbus-monitor not found: sudo apt install dbus-bin")
+    old_proxies = _proxy_pids()
+    raw = subprocess.Popen(["dbus-monitor", "--session"], stdout=subprocess.PIPE,
+                           stderr=subprocess.STDOUT, text=True)
+    lines = []
+    import threading
+    reader = threading.Thread(target=lambda: lines.extend(raw.stdout), daemon=True)
+    reader.start()
+    time.sleep(1.0)
+
+    launch(names, [])
+    sober_conns = {}  # unique bus name -> busctl line
+    end = time.time() + seconds
+    print(f"Recording D-Bus for {seconds}s. Leave the windows alone until it says done...")
+    while time.time() < end:
+        new = _proxy_pids() - old_proxies
+        for l in _sh(["busctl", "--user", "list", "--no-legend"]).splitlines():
+            cols = l.split()
+            if len(cols) >= 2 and cols[1].isdigit() and int(cols[1]) in new:
+                sober_conns.setdefault(cols[0], l)
+        time.sleep(1.0)
+    raw.terminate()
+    reader.join(timeout=3)
+
+    # dbus-monitor: a message is a header line at column 0 plus indented args.
+    blocks, cur = [], []
+    for l in lines:
+        if l and not l[0].isspace() and cur:
+            blocks.append(cur)
+            cur = []
+        cur.append(l.rstrip("\n"))
+    if cur:
+        blocks.append(cur)
+    keep = []
+    for b in blocks:
+        head = b[0]
+        m_s = re.search(r"sender=(\S+)", head)
+        m_d = re.search(r"destination=(\S+)", head)
+        ends = {m.group(1) for m in (m_s, m_d) if m}
+        text = "\n".join(b)
+        if ends & set(sober_conns) or "vinegarhq" in text.lower():
+            keep.append(text)
+
+    out = ["== Sober bus connections (via its xdg-dbus-proxy)"]
+    out += [f"  {l}" for l in sober_conns.values()] or ["  (none found)"]
+    out += [f"== Sober D-Bus messages ({len(keep)} of {len(blocks)} recorded)"] + keep
+    if len(out) > 6000:
+        out = out[:6000] + ["... (cut)"]
+    path = os.path.join(REAL_HOME, "sober_multi_trace.txt")
+    with open(path, "w") as f:
+        f.write("\n".join(out) + "\n")
+    print(f"Done. Saved to {path}")
+
+
 def main():
     p = argparse.ArgumentParser(description="Run multiple Sober instances, one per profile.")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -332,6 +406,9 @@ def main():
     pr = sub.add_parser("remove", help="delete profiles")
     pr.add_argument("names", nargs="+")
     sub.add_parser("diagnose", help="with Sober running, dump how it detects other instances")
+    pt = sub.add_parser("trace", help="launch profiles and record Sober's D-Bus traffic")
+    pt.add_argument("names", nargs="*", default=["alt1", "alt2"])
+    pt.add_argument("--seconds", type=int, default=60)
 
     # argparse can't split "names... -- args" on its own.
     argv = sys.argv[1:]
@@ -349,6 +426,8 @@ def main():
         remove(args.names)
     elif args.cmd == "diagnose":
         diagnose()
+    elif args.cmd == "trace":
+        trace(args.names, args.seconds)
 
 
 if __name__ == "__main__":
