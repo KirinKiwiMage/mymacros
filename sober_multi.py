@@ -282,6 +282,33 @@ def _find_inodes(wanted):
         walk(os.path.expanduser("~"), skip=APP_DIR)
 
 
+TCP_STATES = {"01": "ESTABLISHED", "0A": "LISTEN", "07": "UNCONN"}
+
+
+def _inet_sockets(netdir):
+    """(proto, local addr, state, inode) for our uid's TCP/UDP sockets."""
+    import socket
+    out = []
+    for proto in ("tcp", "tcp6", "udp", "udp6"):
+        try:
+            with open(f"{netdir}/{proto}") as f:
+                rows = f.read().splitlines()[1:]
+        except OSError:
+            continue
+        for row in rows:
+            c = row.split()
+            if len(c) < 10 or c[7] != str(os.getuid()):
+                continue
+            host, port = c[1].split(":")
+            raw = bytes.fromhex(host)
+            # /proc stores addresses as host-order 32-bit words.
+            raw = b"".join(raw[i:i + 4][::-1] for i in range(0, len(raw), 4))
+            fam = socket.AF_INET6 if proto.endswith("6") else socket.AF_INET
+            addr = f"{socket.inet_ntop(fam, raw)}:{int(port, 16)}"
+            out.append((proto, addr, TCP_STATES.get(c[3], c[3]), c[9]))
+    return out
+
+
 def _ps_envs():
     """`flatpak ps` only sees instances under its XDG_RUNTIME_DIR, so also
     look in each --isolate-runtime profile's."""
@@ -406,6 +433,9 @@ def diagnose():
                         out.append(f"  unix socket {cols[7]}")
         except OSError:
             pass
+        for proto, addr, state, ino in _inet_sockets(f"/proc/{pid}/net"):
+            if ino in socks:
+                out.append(f"  {proto} socket {addr} {state}")
         for l in locks:
             cols = l.split()
             if len(cols) >= 6 and cols[4] == str(pid):
@@ -436,6 +466,20 @@ def diagnose():
     except OSError as e:
         names = [f"<{e.strerror}>"]
     out += ["== abstract unix sockets (shared network namespace)"] + [f"  {n}" for n in names]
+    # Ports every instance shares. Compare with the closed baseline.
+    net = f"/proc/{pids[-1]}/net" if pids else "/proc/self/net"
+    listen = sorted({f"{p} {a} {st}" for p, a, st, _ in _inet_sockets(net)
+                     if st in ("LISTEN", "UNCONN")})
+    out += ["== listening TCP / bound UDP ports (shared network namespace)"]
+    out += [f"  {l}" for l in listen] or ["  (none)"]
+    # Lock kinds not tied to a pid above: OFD locks (pid -1) and any lock
+    # on a namespace file (nsfs, like the time namespace).
+    nsfs = {os.stat(f"/proc/self/ns/{n}").st_dev for n in ("time", "pid")}
+    nsdevs = {f"{os.major(d):02x}:{os.minor(d):02x}" for d in nsfs}
+    odd = [l for l in locks if "OFDLCK" in l or
+           any(f" {d}:" in l for d in nsdevs)]
+    out += ["== OFD / namespace-file locks"]
+    out += [f"  {l}" for l in odd] or ["  (none)"]
     out += ["== X11 (shared by all instances)"] + _x11_report()
     if pids:
         # The sandbox's view of the filesystem: the innermost bwrap we can read.
