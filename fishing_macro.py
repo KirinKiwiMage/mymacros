@@ -58,10 +58,10 @@ RING_DIFF = 70           # any time: same, for the thinner approach ring
 RING_SEARCH = 4          # look for the ring out to this many disc radii
 MAX_DISC_R = 0.06        # fraction of screen height; caps the ring search
 
-ANYTIME_CLICK_RATIO = 1.6  # any time: click once ring radius <= this x disc radius
-                           # (rings start ~2.9x and close to 1.0x; hits counted 1.0-2.0)
+ANYTIME_CLICK_RATIO = 2.5  # any time: click once ring radius <= this x disc radius
+                           # (rings sit at ~2.9x for a moment, then shrink to 1.0x)
 RECLICK_AFTER = 0.40        # click the same spot again if the disc is still there
-CLICK_GAP = 0.04            # minimum time between two clicks
+CLICK_GAP = 0.01            # minimum time between two clicks
 MOVE_SETTLE = 0.035         # time between moving the mouse and pressing (~2 game frames)
 CLICK_HOLD = 0.035          # how long the button is held down (~2 game frames)
 
@@ -157,9 +157,10 @@ def ring_ratio(small, tint, x, y):
 
 
 def detect(frame):
-    """Return (mode, ready, found): centres [(x, y), ...] of discs ready to
-    click, in frame pixels (timing: ring has closed; any time: ring is part-way
-    in), and how many discs were found in total."""
+    """Return (mode, ready, found): [(x, y, ring ratio), ...] for discs ready
+    to click, in frame pixels (timing: ring has closed; any time: ring is
+    moving in), and how many discs were found in total. A lower ring ratio
+    means the disc is closer to running out of time."""
     mode, tint = classify(frame)
     if mode is None:
         return None, [], 0
@@ -173,12 +174,13 @@ def detect(frame):
         mask = np.abs(small - tint).sum(axis=2) > COLOR_DIFF
         expected = ANYTIME_DISC_R * height / STRIDE
     found = find_discs(mask, expected)
-    ready = found
-    if mode == "anytime":
-        ready = [d for d in found
-                 if (ratio := ring_ratio(small, tint, d[0], d[1])) is not None
+    if mode == "timing":
+        ready = [(x, y, 1.0) for x, y, _ in found]
+    else:
+        ready = [(x, y, ratio) for x, y, _ in found
+                 if (ratio := ring_ratio(small, tint, x, y)) is not None
                  and ratio <= ANYTIME_CLICK_RATIO]
-    return mode, [(x * STRIDE, y * STRIDE) for x, y, _ in ready], len(found)
+    return mode, [(x * STRIDE, y * STRIDE, ratio) for x, y, ratio in ready], len(found)
 
 
 class Screen:
@@ -250,7 +252,7 @@ def debug_writer():
     while True:
         name, frame, discs, click = debug_queue.get()
         img = frame[::2, ::2].copy()
-        for x, y in discs:   # green box around every disc found
+        for x, y, _ in discs:   # green box around every disc ready to click
             x, y = int(x) // 2, int(y) // 2
             img[max(y - 20, 0):y + 20, max(x - 20, 0):x + 20][[0, -1]] = (0, 255, 0)
             img[max(y - 20, 0):y + 20, max(x - 20, 0):x + 20][:, [0, -1]] = (0, 255, 0)
@@ -272,7 +274,7 @@ def macro_loop():
         while not quitting.is_set():
             if not running.wait(0.1):
                 continue
-            tracked = []             # discs on screen: {"x", "y", "first", "clicked"}
+            tracked = []             # discs on screen: {"x", "y", "ratio", "clicked"}
             last_mode_time = None
             recast_done = True
             last_click = -1e9
@@ -315,18 +317,19 @@ def macro_loop():
                     # Match each disc to the one seen nearest to it last frame.
                     match_dist = ANYTIME_DISC_R * frame.shape[0]
                     still_there = []
-                    for x, y in discs:
+                    for x, y, ratio in discs:
                         old = min(tracked, default=None,
                                   key=lambda d: (d["x"] - x) ** 2 + (d["y"] - y) ** 2)
                         if old and (old["x"] - x) ** 2 + (old["y"] - y) ** 2 < match_dist ** 2:
                             tracked.remove(old)
-                            old["x"], old["y"] = x, y
+                            old["x"], old["y"], old["ratio"] = x, y, ratio
                             still_there.append(old)
                         else:
-                            still_there.append({"x": x, "y": y, "first": now, "clicked": -1e9})
+                            still_there.append({"x": x, "y": y, "ratio": ratio, "clicked": -1e9})
                     tracked = still_there
 
-                    for disc in sorted(tracked, key=lambda d: d["first"]):
+                    # Most urgent first: the ring closest to closing.
+                    for disc in sorted(tracked, key=lambda d: d["ratio"]):
                         if now - disc["clicked"] < RECLICK_AFTER:
                             continue
                         gap = CLICK_GAP - (time.monotonic() - last_click)
