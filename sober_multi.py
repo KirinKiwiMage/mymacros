@@ -28,6 +28,7 @@ Usage:
     python3 sober_multi.py trace alt1 alt2         # launch + record Sober's D-Bus
 
 launch options:
+    --same-pids         don't move each profile's game process to its own pid
     --share-timens      don't give each instance its own time namespace
     --isolate-runtime   own /tmp and /run/user per profile (experimental)
     --share-ipc         don't give each instance its own IPC namespace
@@ -175,7 +176,25 @@ def check_timens():
                  "Or run with --share-timens (second instance will hit 'frozen instance').")
 
 
-def launch(names, extra_args, share_ipc=False, isolate_runtime=False, share_timens=False):
+# Each sandbox numbers its processes from 1, so every instance's game
+# process is pid 3 and its window says _NET_WM_PID=3. Sober's watchdog
+# looks for "pid 3's" Sober window, finds two, and calls one frozen.
+# Burning some pids before exec'ing sober moves each profile's game
+# process to its own pid.
+PID_STEP = 500
+PID_WRAPPER = ('n=0; while [ "$n" -lt "$SOBER_MULTI_PIDS" ]; do /bin/true; n=$((n+1)); done; '
+               'exec sober "$@"')
+
+
+def pid_offset(name):
+    """Stable per-profile offset: 500 x (position among profiles + 1)."""
+    names = sorted(n for n in os.listdir(PROFILES_DIR)
+                   if os.path.isdir(os.path.join(PROFILES_DIR, n)))
+    return PID_STEP * (names.index(name) + 1)
+
+
+def launch(names, extra_args, share_ipc=False, isolate_runtime=False, share_timens=False,
+           same_pids=False):
     check_sober()
     if not share_timens:
         check_timens()
@@ -190,7 +209,12 @@ def launch(names, extra_args, share_ipc=False, isolate_runtime=False, share_time
         # instance its own.
         flags = [] if share_ipc else ["--unshare=ipc"]
         prefix = [] if share_timens else timens_prefix()
-        proc = subprocess.Popen([*prefix, "flatpak", "run", *flags, APP_ID, *extra_args],
+        if same_pids:
+            run = [*flags, APP_ID, *extra_args]
+        else:
+            run = [*flags, f"--env=SOBER_MULTI_PIDS={pid_offset(name)}", "--command=sh",
+                   APP_ID, "-c", PID_WRAPPER, "sober", *extra_args]
+        proc = subprocess.Popen([*prefix, "flatpak", "run", *run],
                                 env=flatpak_env(root, fake_runtime(name) if isolate_runtime else None),
                                 cwd=root,
                                 stdout=log, stderr=subprocess.STDOUT,
@@ -580,6 +604,8 @@ def main():
                     help="profile names; args after -- go to Sober (e.g. a roblox:// link)")
     pl.add_argument("--share-ipc", action="store_true",
                     help="don't give instances their own IPC namespace (if graphics break)")
+    pl.add_argument("--same-pids", action="store_true",
+                    help="don't shift each profile's game process to its own pid")
     pl.add_argument("--share-timens", action="store_true",
                     help="don't give each instance its own time namespace")
     pl.add_argument("--isolate-runtime", action="store_true",
@@ -603,7 +629,8 @@ def main():
     args = p.parse_args(argv)
 
     if args.cmd == "launch":
-        launch(args.names, extra, args.share_ipc, args.isolate_runtime, args.share_timens)
+        launch(args.names, extra, args.share_ipc, args.isolate_runtime, args.share_timens,
+               args.same_pids)
     elif args.cmd == "list":
         list_profiles()
     elif args.cmd == "remove":
