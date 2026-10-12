@@ -219,9 +219,7 @@ def diagnose():
         if len(parts) == 2 and parts[1] == APP_ID and parts[0].isdigit():
             pids += _children(int(parts[0]))
     if not pids:
-        out.append("!! No running Sober found. Start one first, then run diagnose.")
-        print("\n".join(out))
-        return
+        out.append("!! No running Sober: this is a baseline to compare against.")
 
     try:
         with open("/proc/locks") as f:
@@ -236,6 +234,20 @@ def diagnose():
         except OSError:
             continue
         out.append(f"== pid {pid} ({comm})")
+        if comm == "bwrap":
+            # Shows whether --unshare=ipc reached the sandbox, and which
+            # namespaces instances share (same ns id = shared).
+            try:
+                with open(f"/proc/{pid}/cmdline", "rb") as f:
+                    argv = f.read().decode(errors="replace").split("\0")
+                out.append("  sandbox flags: " + " ".join(a for a in argv if a.startswith("--unshare")))
+            except OSError:
+                pass
+            for ns in ("ipc", "net", "pid"):
+                try:
+                    out.append(f"  ns {os.readlink(f'/proc/{pid}/ns/{ns}')}")
+                except OSError:
+                    pass
         socks = set()
         try:
             fds = os.listdir(f"/proc/{pid}/fd")
@@ -268,14 +280,12 @@ def diagnose():
                 if int(major, 16):  # 0 = virtual fs (/proc etc.), skip
                     held[(int(major, 16), int(minor, 16), int(ino))] = None
 
-    out.append("== locked files (Sober hides its fds, so look them up by inode)")
-    _find_inodes(held)
-    for (major, minor, ino), path in held.items():
-        out.append(f"  {major:x}:{minor:02x}:{ino} -> {path or '(not found under home)'}")
+    if pids:
+        out.append("== locked files (Sober hides its fds, so look them up by inode)")
+        _find_inodes(held)
+        for (major, minor, ino), path in held.items():
+            out.append(f"  {major:x}:{minor:02x}:{ino} -> {path or '(not found under home)'}")
 
-    # The sandbox's view of the filesystem: the innermost bwrap we can read.
-    root = next((f"/proc/{p}/root" for p in reversed(pids)
-                 if os.path.exists(f"/proc/{p}/root/.flatpak-info")), f"/proc/{pids[0]}/root")
     # Shared with the host unless --unshare=ipc / no network: SysV IPC and
     # abstract unix sockets are where a cross-instance check could hide.
     for kind in ("shm", "sem", "msg"):
@@ -286,22 +296,24 @@ def diagnose():
             rows = [f"<{e.strerror}>"]
         out += [f"== sysv {kind} (host IPC namespace)"] + [f"  {r}" for r in rows]
     try:
-        with open(f"/proc/{pids[-1]}/net/unix") as f:
+        with open(f"/proc/{pids[-1] if pids else 'self'}/net/unix") as f:
             names = sorted({c[7] for c in (l.split() for l in f.read().splitlines()[1:])
                             if len(c) >= 8 and c[7].startswith("@")})
     except OSError as e:
         names = [f"<{e.strerror}>"]
     out += ["== abstract unix sockets (shared network namespace)"] + [f"  {n}" for n in names]
-    try:
+    if pids:
+        # The sandbox's view of the filesystem: the innermost bwrap we can read.
+        root = next((f"/proc/{p}/root" for p in reversed(pids)
+                     if os.path.exists(f"/proc/{p}/root/.flatpak-info")), f"/proc/{pids[0]}/root")
         out += ["== sandbox /dev/shm"] + _ls(f"{root}/dev/shm")
-    except OSError:
-        pass
-    out += [f"== sandbox /tmp"] + _ls(f"{root}/tmp")
-    out += [f"== sandbox /run/user/{os.getuid()}"] + _ls(f"{root}/run/user/{os.getuid()}")
-    out += [f"== sandbox /run/flatpak"] + _ls(f"{root}/run/flatpak", depth=1)
+        out += [f"== sandbox /tmp"] + _ls(f"{root}/tmp")
+        out += [f"== sandbox /run/user/{os.getuid()}"] + _ls(f"{root}/run/user/{os.getuid()}")
+        out += [f"== sandbox /run/flatpak"] + _ls(f"{root}/run/flatpak", depth=1)
 
     report = "\n".join(out)
-    path = os.path.join(APP_DIR, "sober_multi_diagnose.txt")
+    name = "sober_multi_diagnose.txt" if pids else "sober_multi_diagnose_closed.txt"
+    path = os.path.join(REAL_HOME, name)
     with open(path, "w") as f:
         f.write(report + "\n")
     print(report)
