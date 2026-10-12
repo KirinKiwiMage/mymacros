@@ -28,6 +28,7 @@ Usage:
     python3 sober_multi.py trace alt1 alt2         # launch + record Sober's D-Bus
 
 launch options:
+    --same-class        keep Sober's window class (org.vinegarhq.Sober)
     --same-pids         don't move each profile's game process to its own pid
     --share-timens      don't give each instance its own time namespace
     --isolate-runtime   own /tmp and /run/user per profile (experimental)
@@ -193,8 +194,15 @@ def pid_offset(name):
     return PID_STEP * (names.index(name) + 1)
 
 
+def wm_class(name):
+    """Per-profile X11 window class. Every Sober window is otherwise
+    WM_CLASS org.vinegarhq.Sober; SDL takes the class from these env vars
+    (SDL2: SDL_VIDEO_X11_WMCLASS, SDL3: SDL_APP_ID) over the app's own."""
+    return f"SoberMulti_{name}"
+
+
 def launch(names, extra_args, share_ipc=False, isolate_runtime=False, share_timens=False,
-           same_pids=False):
+           same_pids=False, same_class=False):
     check_sober()
     if not share_timens:
         check_timens()
@@ -209,6 +217,9 @@ def launch(names, extra_args, share_ipc=False, isolate_runtime=False, share_time
         # instance its own.
         flags = [] if share_ipc else ["--unshare=ipc"]
         prefix = [] if share_timens else timens_prefix()
+        if not same_class:
+            flags = [*flags, f"--env=SDL_VIDEO_X11_WMCLASS={wm_class(name)}",
+                     f"--env=SDL_APP_ID={wm_class(name)}"]
         if same_pids:
             run = [*flags, APP_ID, *extra_args]
         else:
@@ -604,6 +615,8 @@ def main():
                     help="profile names; args after -- go to Sober (e.g. a roblox:// link)")
     pl.add_argument("--share-ipc", action="store_true",
                     help="don't give instances their own IPC namespace (if graphics break)")
+    pl.add_argument("--same-class", action="store_true",
+                    help="keep Sober's own window class instead of one per profile")
     pl.add_argument("--same-pids", action="store_true",
                     help="don't shift each profile's game process to its own pid")
     pl.add_argument("--share-timens", action="store_true",
@@ -630,7 +643,7 @@ def main():
 
     if args.cmd == "launch":
         launch(args.names, extra, args.share_ipc, args.isolate_runtime, args.share_timens,
-               args.same_pids)
+               args.same_pids, args.same_class)
     elif args.cmd == "list":
         list_profiles()
     elif args.cmd == "remove":
