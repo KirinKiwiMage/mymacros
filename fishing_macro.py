@@ -17,8 +17,13 @@ else in that box turns that shade of red). If no bite shows up within
 NO_BITE_TIMEOUT the line is reeled in and recast, so a lost/despawned
 line never stalls the loop.
 
-Run with --test to print how many red pixels the detector sees, so you can
-check the box/threshold on your screen before letting it fish.
+Setup (once, or whenever the window/camera changes):
+    python3 fishing_macro.py --calibrate
+        hover the mouse just above your character's head (where the "!"
+        bubble pops up) and press Numpad 7. Saved to fishing_box.json.
+    python3 fishing_macro.py --test
+        prints what the detector sees twice a second; press Numpad 7 while
+        the "!" is up to save fishing_debug_full.png / fishing_debug_box.png.
 
 Hotkeys:
     Numpad 7 - start
@@ -28,11 +33,13 @@ Hotkeys:
 Requires: pip install pynput pillow   (X11 session, which Zorin uses by default)
 """
 
+import json
+import os
 import sys
 import threading
 import time
 
-from PIL import ImageChops, ImageGrab
+from PIL import ImageChops, ImageGrab, ImageStat
 from pynput import keyboard, mouse
 
 from numpad_hotkeys import is_start, is_stop
@@ -48,12 +55,15 @@ REEL_MAX = 8.0           # stop reeling after this long even if "!" is still see
 CATCH_TO_CAST = 2.5      # "!" gone -> next cast (catch animation)
 POLL = 0.05              # how often the screen is checked for the "!"
 
-# Box (fractions of the screen) above the character where the "!" appears.
-# In the 1920x1080 recording the red "!" sits around x 950-966, y 400-465.
-SEARCH_BOX = (0.40, 0.25, 0.60, 0.55)   # left, top, right, bottom
-RED_MIN = 150            # "!" red channel is at least this
-OTHER_MAX = 90           # ...and green/blue at most this
-BITE_PIXELS = 60         # red pixels needed to count as a bite (seen: 240-690)
+# Box around the spot picked with --calibrate where the "!" appears. Without
+# calibration it falls back to the middle of the primary monitor.
+BOX_SIZE = (360, 360)    # width, height in pixels
+DEFAULT_BOX = (0.40, 0.25, 0.60, 0.55)  # fractions of the primary monitor
+# A pixel counts as "!"-red when red is bright and well above green and blue.
+# Differences rather than fixed values so gamma/colour tweaks don't break it.
+RED_MIN = 120
+RED_OVER_OTHERS = 100    # skin tones only reach ~75
+BITE_PIXELS = 40         # red pixels needed to count as a bite (seen: 240-690)
 
 LENIENCY = 0.15          # extra seconds added to each wait for lag spikes
 # -------------------------------------------------------------------------
@@ -64,22 +74,51 @@ quitting = threading.Event()
 _box = None
 
 
+HERE = os.path.dirname(os.path.abspath(__file__))
+BOX_FILE = os.path.join(HERE, "fishing_box.json")
+
+
 def search_box():
     global _box
     if _box is None:
-        w, h = ImageGrab.grab().size
-        l, t, r, b = SEARCH_BOX
-        _box = (int(l * w), int(t * h), int(r * w), int(b * h))
+        try:
+            with open(BOX_FILE) as f:
+                cx, cy = json.load(f)["center"]
+            w, h = BOX_SIZE
+            _box = (cx - w // 2, cy - h // 2, cx + w // 2, cy + h // 2)
+        except (OSError, ValueError, KeyError):
+            x, y, w, h = primary_monitor()
+            l, t, r, b = DEFAULT_BOX
+            _box = (x + int(l * w), y + int(t * h), x + int(r * w), y + int(b * h))
     return _box
 
 
-def red_pixels():
+def primary_monitor():
+    """(x, y, width, height) of the primary monitor. The screen grab spans
+    every monitor, so the box has to be offset onto the one the game is on."""
+    try:
+        from Xlib.display import Display
+        d = Display()
+        for m in d.screen().root.xrandr_get_monitors().monitors:
+            if m.primary:
+                return m.x, m.y, m.width_in_pixels, m.height_in_pixels
+    except Exception:
+        pass
+    w, h = ImageGrab.grab().size
+    return 0, 0, w, h
+
+
+def grab_box():
+    return ImageGrab.grab(bbox=search_box()).convert("RGB")
+
+
+def red_pixels(img=None):
     """Number of "!"-red pixels in the search box."""
-    r, g, b = ImageGrab.grab(bbox=search_box()).convert("RGB").split()
-    r = r.point(lambda v: 255 if v >= RED_MIN else 0)
-    g = g.point(lambda v: 255 if v <= OTHER_MAX else 0)
-    b = b.point(lambda v: 255 if v <= OTHER_MAX else 0)
-    mask = ImageChops.multiply(ImageChops.multiply(r, g), b)
+    r, g, b = (img or grab_box()).split()
+    bright = r.point(lambda v: 255 if v >= RED_MIN else 0)
+    over_g = ImageChops.subtract(r, g).point(lambda v: 255 if v >= RED_OVER_OTHERS else 0)
+    over_b = ImageChops.subtract(r, b).point(lambda v: 255 if v >= RED_OVER_OTHERS else 0)
+    mask = ImageChops.multiply(ImageChops.multiply(bright, over_g), over_b)
     return mask.histogram()[255]
 
 
@@ -177,21 +216,65 @@ def on_press(key):
         print("[macro] stopped")
 
 
-def test_detector():
-    print(f"[test] search box {search_box()}, bite at >= {BITE_PIXELS} red px. Ctrl+C to quit")
+def calibrate():
+    print("[calibrate] hover the mouse just above your character's head, where the")
+    print("[calibrate] \"!\" bubble pops up, then press Numpad 7 (Ctrl+C to cancel)")
+
+    def on_key(key):
+        if is_start(key):
+            x, y = (int(v) for v in mouse.Controller().position)
+            with open(BOX_FILE, "w") as f:
+                json.dump({"center": [x, y]}, f)
+            print(f"[calibrate] saved centre ({x}, {y}) to {BOX_FILE}")
+            return False
+
     try:
-        while True:
-            n = red_pixels()
-            print(f"[test] red px = {n:5d}  {'BITE' if n >= BITE_PIXELS else ''}")
-            time.sleep(0.5)
+        with keyboard.Listener(on_press=on_key) as listener:
+            listener.join()
     except KeyboardInterrupt:
         pass
 
 
+def test_detector():
+    full = ImageGrab.grab()
+    print(f"[test] screen grab is {full.size[0]}x{full.size[1]}, "
+          f"search box {search_box()}"
+          f"{'' if os.path.exists(BOX_FILE) else ' (NOT calibrated, run --calibrate)'}")
+    print(f"[test] bite at >= {BITE_PIXELS} red px. Numpad 7 = save screenshots, Ctrl+C = quit")
+
+    def on_key(key):
+        if is_start(key):
+            ImageGrab.grab().save(os.path.join(HERE, "fishing_debug_full.png"))
+            grab_box().save(os.path.join(HERE, "fishing_debug_box.png"))
+            print("[test] saved fishing_debug_full.png and fishing_debug_box.png")
+
+    listener = keyboard.Listener(on_press=on_key)
+    listener.start()
+    try:
+        while True:
+            img = grab_box()
+            n = red_pixels(img)
+            bright = sum(ImageStat.Stat(img).mean) / 3
+            note = "  <- grab is black, screen capture not working" if bright < 2 else ""
+            print(f"[test] red px = {n:5d}  brightness = {bright:5.1f}  "
+                  f"{'BITE' if n >= BITE_PIXELS else ''}{note}")
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        listener.stop()
+
+
 def main():
+    if "--calibrate" in sys.argv:
+        calibrate()
+        return
     if "--test" in sys.argv:
         test_detector()
         return
+    if not os.path.exists(BOX_FILE):
+        print("[macro] not calibrated, using the middle of the screen "
+              "(run with --calibrate if bites are missed)")
     print("[macro] Numpad 7 = start, Numpad 8 = stop, Ctrl+C = quit "
           "(equip the rod and point the mouse at the water first)")
     worker = threading.Thread(target=macro_loop, daemon=True)
