@@ -3,26 +3,28 @@
 Roblox fishing macro (pynput, X11).
 
 From the recording, one catch goes:
-    1. Click            -> cast the line (rod must already be equipped)
+    0. Press 2, then 1  -> swap off the rod and back, so it's always held and
+                           NOT cast before casting (clicks toggle cast/reel,
+                           so this keeps a stray click from flipping it)
+    1. Click            -> cast the line
     2. Wait             -> RANDOM time until a bite, no fixed timer
     3. Bite             -> a white bubble with a red "!" pops up above the
                            character and stays ~2s
-    4. Click            -> reel in until the "Fish Caught" banner pops up in
-                           the bottom right (it shows up while the "!" is
-                           still visible, so clicking on until the "!" goes
-                           would cast the rod again)
-    5. Wait ~2.5s       -> catch animation, then back to 1 (recast)
+    4. Click            -> reel in until the yellow "Fish Caught" or blue
+                           "Treasure Caught" banner pops up in the bottom
+                           right (it shows up while the "!" is still visible)
+    5. Count it, back to 0
 
 The bite is detected by looking for the red "!" in a box above the middle
 of the screen. That bubble is GUI, not lit by the world, so it looks the same
 at day and night (the scene drops to ~55% brightness at night and nothing
 else in that box turns that shade of red). The catch is detected by the
-yellow "Fish Caught" header appearing in the bottom right.
+banner header appearing in the bottom right.
 
-If no bite shows up within NO_BITE_TIMEOUT the line is reeled in and
-recast. Every click toggles cast/reel, so if a stray click ever leaves the
-rod in the wrong state (cast when the macro thinks it's reeled in), the
-next timeout clicks once instead of twice to get back in step.
+If no bite shows up within NO_BITE_TIMEOUT it goes back to step 0, which
+pulls the line in and recasts.
+
+Slot 1 must be the rod and slot 2 any other item.
 
 Setup (once, or whenever the window/camera changes):
     python3 fishing_macro.py --calibrate
@@ -31,7 +33,7 @@ Setup (once, or whenever the window/camera changes):
     python3 fishing_macro.py --test
         prints what the detector sees twice a second; press Numpad 7 while
         the "!" is up to save fishing_debug_full.png / fishing_debug_box.png.
-        "caught px" should jump when the "Fish Caught" banner shows.
+        "fish px" / "treasure px" should jump when a banner shows.
 
 Hotkeys:
     Numpad 7 - start
@@ -54,14 +56,18 @@ from numpad_hotkeys import is_start, is_stop
 
 # ---- tuning -------------------------------------------------------------
 CAST_BUTTON = mouse.Button.left
+ROD_SLOT = "1"
+OTHER_SLOT = "2"
 
-CLICK_HOLD = 0.05        # how long the mouse is held for a click
+CLICK_HOLD = 0.05        # how long the mouse / a key is held for a tap
+AFTER_CATCH = 0.3        # banner seen -> start swapping slots
+SLOT_GAP = 0.4           # press 2 -> press 1
+EQUIP_SETTLE = 0.6       # press 1 -> cast
 CAST_SETTLE = 2.0        # after casting, ignore the screen while the line flies out
 NO_BITE_TIMEOUT = 90.0   # no "!" for this long -> reel in and recast
 REEL_CLICK_GAP = 0.15    # time between reel clicks
 REEL_AFTER_BITE = 5.0    # keep clicking this long after the "!" goes (slow fish)
 REEL_MAX = 20.0          # give up reeling after this long (fish got away)
-CATCH_TO_CAST = 2.5      # "Fish Caught" -> next cast (catch animation)
 POLL = 0.05              # how often the screen is checked for the "!"
 
 # Box around the spot picked with --calibrate where the "!" appears. Without
@@ -75,16 +81,19 @@ RED_OVER_OTHERS = 100    # skin tones only reach ~75
 BITE_PIXELS = 40         # red pixels needed to count as a bite (seen: 240-690)
 
 # Bottom-right area (fractions of the primary monitor) where the yellow
-# "Fish Caught" header slides in, above the quest list.
+# "Fish Caught" / blue "Treasure Caught" header slides in, above the quests.
 CAUGHT_BOX = (0.85, 0.55, 1.00, 0.80)
-YELLOW_MIN = 180         # header red and green are at least this
+YELLOW_MIN = 180         # fish header: red and green at least this
 YELLOW_BLUE_MAX = 110    # ...and blue at most this
-CAUGHT_PIXELS = 100      # new yellow pixels that mean "caught" (seen: +450)
+BLUE_MIN = 170           # treasure header: blue at least this
+BLUE_OVER_RED = 110      # ...and this much above red
+CAUGHT_PIXELS = 100      # new header pixels that mean "caught" (fish seen: +450)
 
 LENIENCY = 0.15          # extra seconds added to each wait for lag spikes
 # -------------------------------------------------------------------------
 
 mo = mouse.Controller()
+kb = keyboard.Controller()
 running = threading.Event()
 quitting = threading.Event()
 _box = None
@@ -152,14 +161,18 @@ def caught_box():
     return _caught_box
 
 
-def yellow_pixels():
-    """Number of "Fish Caught"-yellow pixels in the bottom-right box."""
+def banner_pixels():
+    """(yellow "Fish Caught", blue "Treasure Caught") pixel counts in the
+    bottom-right box."""
     r, g, b = ImageGrab.grab(bbox=caught_box()).convert("RGB").split()
-    r = r.point(lambda v: 255 if v >= YELLOW_MIN else 0)
-    g = g.point(lambda v: 255 if v >= YELLOW_MIN else 0)
-    b = b.point(lambda v: 255 if v <= YELLOW_BLUE_MAX else 0)
-    mask = ImageChops.multiply(ImageChops.multiply(r, g), b)
-    return mask.histogram()[255]
+    yr = r.point(lambda v: 255 if v >= YELLOW_MIN else 0)
+    yg = g.point(lambda v: 255 if v >= YELLOW_MIN else 0)
+    yb = b.point(lambda v: 255 if v <= YELLOW_BLUE_MAX else 0)
+    yellow = ImageChops.multiply(ImageChops.multiply(yr, yg), yb)
+    bb = b.point(lambda v: 255 if v >= BLUE_MIN else 0)
+    br = ImageChops.subtract(b, r).point(lambda v: 255 if v >= BLUE_OVER_RED else 0)
+    blue = ImageChops.multiply(bb, br)
+    return yellow.histogram()[255], blue.histogram()[255]
 
 
 def wait(seconds):
@@ -181,11 +194,31 @@ def click():
         mo.release(CAST_BUTTON)
 
 
-def release_all():
+def tap(key):
+    kb.press(key)
     try:
-        mo.release(CAST_BUTTON)
-    except Exception:
-        pass
+        time.sleep(CLICK_HOLD)
+    finally:
+        kb.release(key)
+
+
+def release_all():
+    for release, key in ((mo.release, CAST_BUTTON), (kb.release, ROD_SLOT),
+                         (kb.release, OTHER_SLOT)):
+        try:
+            release(key)
+        except Exception:
+            pass
+
+
+def reset_rod():
+    """Swap to slot 2 and back to the rod so it's held and not cast.
+    False if the macro was stopped."""
+    tap(OTHER_SLOT)
+    if not wait(SLOT_GAP + LENIENCY):
+        return False
+    tap(ROD_SLOT)
+    return wait(EQUIP_SETTLE + LENIENCY)
 
 
 def wait_for_bite():
@@ -200,18 +233,21 @@ def wait_for_bite():
 
 
 def reel():
-    """Click until the "Fish Caught" banner appears.
-    Returns "caught", "lost" (gave up) or None if the macro was stopped.
-    The banner is compared against how much yellow was there before reeling,
-    so a banner left over from the last catch doesn't count."""
-    baseline = yellow_pixels()
+    """Click until a "Fish Caught" / "Treasure Caught" banner appears.
+    Returns "fish", "treasure", "lost" (gave up) or None if stopped.
+    Banners are compared against what was there before reeling, so one left
+    over from the last catch doesn't count."""
+    base_yellow, base_blue = banner_pixels()
     start = last_bite = time.monotonic()
     while True:
         if not running.is_set() or quitting.is_set():
             return None
         # check before clicking: a click after the catch casts the rod again
-        if yellow_pixels() >= baseline + CAUGHT_PIXELS:
-            return "caught"
+        yellow, blue = banner_pixels()
+        if yellow >= base_yellow + CAUGHT_PIXELS:
+            return "fish"
+        if blue >= base_blue + CAUGHT_PIXELS:
+            return "treasure"
         now = time.monotonic()
         if bite_visible():
             last_bite = now
@@ -225,9 +261,13 @@ def reel():
 
 
 def macro_loop():
-    misses = 0   # no-bite timeouts in a row
+    counts = {"fish": 0, "treasure": 0}
     while not quitting.is_set():
         if not running.wait(timeout=0.1):
+            continue
+
+        # 0. rod held and not cast, whatever state the last cycle left it in
+        if not reset_rod():
             continue
 
         # 1. cast
@@ -237,28 +277,22 @@ def macro_loop():
 
         # 2. wait for a random-length bite
         if not wait_for_bite():
-            if running.is_set():
-                misses += 1
-                if misses % 2:
-                    print("[macro] no bite, reeling in and recasting")
-                    click()                  # reel the empty line in
-                else:
-                    # still nothing: the rod was probably not cast at all,
-                    # so only the recast click below (one toggle, not two)
-                    print("[macro] no bite again, re-syncing cast state")
-                wait(CATCH_TO_CAST + LENIENCY)
+            if running.is_set() and not quitting.is_set():
+                print("[macro] no bite, recasting")
             continue
-        misses = 0
 
         # 3. reel in
         print("[macro] bite!")
         result = reel()
         if result is None:
             continue
-        print("[macro] caught!" if result == "caught" else "[macro] fish got away")
-
-        # 4. let the catch animation finish, then recast
-        wait(CATCH_TO_CAST + LENIENCY)
+        if result == "lost":
+            print("[macro] fish got away")
+        else:
+            counts[result] += 1
+            print(f"[macro] {result} caught! fish: {counts['fish']}, "
+                  f"treasure: {counts['treasure']}")
+        wait(AFTER_CATCH + LENIENCY)
 
     release_all()
 
@@ -298,7 +332,7 @@ def test_detector():
           f"search box {search_box()}"
           f"{'' if os.path.exists(BOX_FILE) else ' (NOT calibrated, run --calibrate)'}")
     print(f"[test] caught box {caught_box()}")
-    print(f"[test] bite at >= {BITE_PIXELS} red px, caught when caught px jumps by "
+    print(f"[test] bite at >= {BITE_PIXELS} red px, caught when fish/treasure px jumps by "
           f">= {CAUGHT_PIXELS}. Numpad 7 = save screenshots, Ctrl+C = quit")
 
     def on_key(key):
@@ -313,10 +347,11 @@ def test_detector():
         while True:
             img = grab_box()
             n = red_pixels(img)
-            y = yellow_pixels()
+            y, bl = banner_pixels()
             bright = sum(ImageStat.Stat(img).mean) / 3
             note = "  <- grab is black, screen capture not working" if bright < 2 else ""
-            print(f"[test] red px = {n:5d}  caught px = {y:5d}  brightness = {bright:5.1f}  "
+            print(f"[test] red px = {n:5d}  fish px = {y:5d}  treasure px = {bl:5d}  "
+                  f"brightness = {bright:5.1f}  "
                   f"{'BITE' if n >= BITE_PIXELS else ''}{note}")
             time.sleep(0.5)
     except KeyboardInterrupt:
@@ -336,7 +371,7 @@ def main():
         print("[macro] not calibrated, using the middle of the screen "
               "(run with --calibrate if bites are missed)")
     print("[macro] Numpad 7 = start, Numpad 8 = stop, Ctrl+C = quit "
-          "(equip the rod and point the mouse at the water first)")
+          "(rod in slot 1, any item in slot 2, mouse pointed at the water)")
     worker = threading.Thread(target=macro_loop, daemon=True)
     worker.start()
     try:
