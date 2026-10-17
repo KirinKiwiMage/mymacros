@@ -9,3 +9,8 @@ Python macros using pynput, run on X11 (Zorin OS).
   top-row/nav keys, so the helper checks the physical KP_7/KP_8 key via the Xlib keymap.
 - Stopping releases any held keys. Quit with Ctrl+C in the terminal.
 - Add a small leniency to waits so lag spikes don't break the timing.
+
+## After pushing
+- Always end by giving the user the exact git commands to download/update the new files on
+  their machine (first-time `git clone` + `git checkout <branch>`, and `git pull` for an
+  existing clone), using the branch that was pushed.
