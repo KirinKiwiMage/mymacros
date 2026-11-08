@@ -130,6 +130,14 @@ for unit in snapd.service snapd.socket snapd.seeded.service ModemManager.service
     sudo systemctl mask --now "$unit" >/dev/null 2>&1 || true
 done
 echo "Background services trimmed."
+# Update now too, rather than only on the next launch, and close a running
+# Sober so the restart loop relaunches it on the new version.
+echo "Updating Sober (flatpak update)..."
+if timeout 600 sudo -n flatpak update -y --noninteractive; then
+    flatpak kill org.vinegarhq.Sober >/dev/null 2>&1 && echo "Closed the running Sober; it reopens updated."
+else
+    echo "WARNING: flatpak update failed (see above)"
+fi
 echo "Sober VM setup applied. Restart loop is now:"
 sed -n '/while true/,/done/p' ~/.xinitrc
 EOF
