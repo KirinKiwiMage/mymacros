@@ -96,7 +96,13 @@ new = ("    [ -f ~/sober-last.log ] && mv ~/sober-last.log ~/sober-prev.log\n"
        "    rc=$?\n"
        "    echo \"$(date '+%F %T') Sober exited with code $rc\" >> ~/sober-restarts.log\n")
 if old in x:
-    open(p, "w").write(x.replace(old, new, 1))
+    x = x.replace(old, new, 1)
+# VMs made before flatpak updated itself: update before each launch.
+upd = "    timeout 600 sudo -n flatpak update -y --noninteractive > ~/flatpak-update.log 2>&1\n"
+anchor = "    [ -f ~/sober-last.log ] && mv ~/sober-last.log ~/sober-prev.log\n"
+if "flatpak update" not in x and anchor in x:
+    x = x.replace(anchor, upd + anchor, 1)
+open(p, "w").write(x)
 PY
 # Sober settings: OpenGL renderer (virgl has no real Vulkan) and Roblox's
 # frame rate capped low, which is most of the CPU/GPU cost per VM.
@@ -247,6 +253,9 @@ write_files:
       # Each run's output is kept (the one before a restart as sober-prev.log)
       # and every exit is logged, for `./sober_vm.sh logs`.
       while true; do
+          # Keep Sober and its runtime up to date before each launch. It's a
+          # system-wide install, hence sudo; capped so bad network can't stall it.
+          timeout 600 sudo -n flatpak update -y --noninteractive > ~/flatpak-update.log 2>&1
           [ -f ~/sober-last.log ] && mv ~/sober-last.log ~/sober-prev.log
           flatpak run org.vinegarhq.Sober > ~/sober-last.log 2>&1
           rc=$?  # before $(date) below resets $?
@@ -506,6 +515,8 @@ echo; echo "== Roblox sessions (one log file per launch, newest last)"
 ls -ltr --time-style=+%T ~/.var/app/org.vinegarhq.Sober/data/sober/appData/logs/ 2>/dev/null | tail -n 12
 echo; echo "== restart loop in ~/.xinitrc (should log exits)"
 sed -n '/while true/,/done/p' ~/.xinitrc
+echo; echo "== last flatpak update (runs before each Sober launch)"
+tail -n 15 ~/flatpak-update.log 2>/dev/null || echo "(none yet)"
 echo; echo "== Sober exits (newest last)"
 tail -n 30 ~/sober-restarts.log 2>/dev/null || echo "(none logged yet: run ./sober_vm.sh update first)"
 echo; echo "== kernel: out-of-memory kills / GPU errors this boot"
