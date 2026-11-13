@@ -16,7 +16,7 @@ Hotkeys:
     Numpad 8 - stop
     Ctrl+C in the terminal - quit
 
-Requires: pip install pynput evdev   (X11 session, which Zorin uses by default)
+Requires: pip install pynput   (X11 session, which Zorin uses by default)
 """
 
 import threading
@@ -24,7 +24,7 @@ import time
 
 from pynput import keyboard
 
-import numpad_hotkeys
+from numpad_hotkeys import is_start, is_stop
 
 # ---- tuning -------------------------------------------------------------
 FIRE_KEY = "q"
@@ -88,14 +88,11 @@ def macro_loop():
     release_all()
 
 
-def on_start():
-    if not running.is_set():
+def on_press(key):
+    if is_start(key) and not running.is_set():
         running.set()
         print("[macro] started")
-
-
-def on_stop():
-    if running.is_set():
+    elif is_stop(key) and running.is_set():
         running.clear()
         release_all()
         print("[macro] stopped")
@@ -106,13 +103,12 @@ def main():
           f"(cycle ~{TAP_HOLD + CAST_TO_CHARGE + CHARGE_HOLD + CHARGE_TO_CAST + 3 * LENIENCY:.2f}s)")
     worker = threading.Thread(target=macro_loop, daemon=True)
     worker.start()
-    hotkeys = numpad_hotkeys.listen(on_start, on_stop)
     try:
-        hotkeys.join()
+        with keyboard.Listener(on_press=on_press) as listener:
+            listener.join()
     except KeyboardInterrupt:
         print("[macro] quitting")
     finally:
-        hotkeys.stop()
         quitting.set()
         running.clear()
         worker.join(timeout=1)
