@@ -15,7 +15,7 @@ Hotkeys (work even when the window isn't focused):
     Numpad 8 - stop
     Close the window or Ctrl+C in the terminal - quit
 
-Requires: pip install pynput python-xlib   (tkinter: sudo apt install python3-tk)
+Requires: pip install pynput python-xlib evdev   (tkinter: sudo apt install python3-tk)
 """
 
 import signal
@@ -27,7 +27,7 @@ from tkinter import ttk
 
 from pynput import keyboard
 
-from numpad_hotkeys import is_start, is_stop
+import numpad_hotkeys
 
 # ---- defaults -----------------------------------------------------------
 DEFAULT_KEY = "shift"
@@ -172,7 +172,9 @@ class App:
 
         self.apply_speed()
 
-        # global hotkeys + key capture
+        # Numpad 7/8 hotkeys (work while the game is focused), plus a pynput
+        # listener just for "Press a key..." (the GUI is focused then)
+        self.hotkeys = numpad_hotkeys.listen(self.on_hotkey_start, self.spammer.stop)
         self.listener = keyboard.Listener(on_press=self.on_press)
         self.listener.start()
 
@@ -211,10 +213,11 @@ class App:
         if self.capturing:
             self.captured = name_from_key(key)
             self.capturing = False
-        elif is_start(key):
+
+    def on_hotkey_start(self):
+        # don't start while picking a key (Numpad 7 may be the key being picked)
+        if not self.capturing and self.captured is None:
             self.spammer.start()
-        elif is_stop(key):
-            self.spammer.stop()
 
     def poll(self):
         if self.captured is not None:
@@ -232,6 +235,7 @@ class App:
         self.root.after(50, self.poll)
 
     def quit(self):
+        self.hotkeys.stop()
         self.listener.stop()
         self.spammer.quit()
         self.root.destroy()
