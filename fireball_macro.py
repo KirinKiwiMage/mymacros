@@ -22,9 +22,13 @@ Requires: pip install pynput   (X11 session, which Zorin uses by default)
 import threading
 import time
 
-from pynput import keyboard
+import session_check
 
-from numpad_hotkeys import is_start, is_stop
+session_check.require_x11("macro")   # before pynput, which needs X11
+
+from pynput import keyboard  # noqa: E402
+
+from numpad_hotkeys import is_start, is_stop  # noqa: E402
 
 # ---- tuning -------------------------------------------------------------
 FIRE_KEY = "q"

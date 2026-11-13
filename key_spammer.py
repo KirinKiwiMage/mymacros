@@ -25,9 +25,13 @@ import time
 import tkinter as tk
 from tkinter import ttk
 
-from pynput import keyboard
+import session_check
 
-from numpad_hotkeys import is_start, is_stop
+session_check.require_x11("spammer")   # before pynput, which needs X11
+
+from pynput import keyboard  # noqa: E402
+
+from numpad_hotkeys import is_start, is_stop  # noqa: E402
 
 # ---- defaults -----------------------------------------------------------
 DEFAULT_KEY = "shift"

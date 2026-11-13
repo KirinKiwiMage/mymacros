@@ -7,5 +7,7 @@ Python macros using pynput, run on X11 (Zorin OS).
   `is_stop(key)` in the pynput `on_press` callback. pynput on X11 reports these keys as
   `'7'`/`'8'` (NumLock on) or `Key.home`/`Key.up` (NumLock off) with no vk, same as the
   top-row/nav keys, so the helper checks the physical KP_7/KP_8 key via the Xlib keymap.
+- Call `session_check.require_x11("<name>")` at the top of every macro, before importing
+  pynput: Zorin can silently log in to Wayland, where pynput doesn't work outside its own windows.
 - Stopping releases any held keys. Quit with Ctrl+C in the terminal.
 - Add a small leniency to waits so lag spikes don't break the timing.
